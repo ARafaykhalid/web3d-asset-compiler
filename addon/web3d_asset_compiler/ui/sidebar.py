@@ -143,12 +143,8 @@ def draw_unified_ui(layout, context):
     # Output Directory
     sub = exporter_box.box()
     sub.label(text="Output Target", icon='FILE_FOLDER')
-    sub.prop(tjs, "portfolio_one_click", icon="CHECKMARK")
-    if tjs.portfolio_one_click:
-        sub.label(text="portfolio/public/models", icon="FILE_TICK")
-    else:
-        sub.prop(tjs, "output_dir")
-        sub.prop(tjs, "base_name")
+    sub.prop(tjs, "output_dir")
+    sub.prop(tjs, "base_name")
 
     # Geometry & Materials
     sub = exporter_box.box()

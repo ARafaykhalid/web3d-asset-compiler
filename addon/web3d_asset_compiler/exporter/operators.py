@@ -9,9 +9,16 @@ import importlib.util
 import bpy
 from bpy.types import Operator
 
-from .properties import PORTFOLIO_OUTPUT_DIRECTORY
 from .character_exporter import export_character_glb
 from .ts_generator import typescript_module
+
+
+def resolve_output_dir(props):
+    raw_path = props.output_dir.strip() or "//web3d_output"
+    abs_path = bpy.path.abspath(raw_path)
+    if not abs_path:
+        abs_path = os.path.join(os.path.expanduser("~"), "web3d_output")
+    return abs_path
 
 
 class TJS_OT_ExportCharacterGLB(Operator):
@@ -22,9 +29,9 @@ class TJS_OT_ExportCharacterGLB(Operator):
 
     def execute(self, context):
         props = context.scene.tjs_props
-        output_dir = PORTFOLIO_OUTPUT_DIRECTORY if props.portfolio_one_click else props.output_dir
+        output_dir = resolve_output_dir(props)
         os.makedirs(output_dir, exist_ok=True)
-        filename = "character.glb" if props.portfolio_one_click else (props.base_name.strip() or "character.glb")
+        filename = props.base_name.strip() or "character.glb"
         if not filename.lower().endswith(".glb"):
             filename += ".glb"
 
@@ -61,16 +68,17 @@ class TJS_OT_ExportAnimations(Operator):
                 "threejs_binary_animation_export.py",
             )
 
+            output_directory = resolve_output_dir(props)
+            os.makedirs(output_directory, exist_ok=True)
+            filename = props.base_name.strip() or "character.glb"
+            if not filename.lower().endswith(".glb"):
+                filename += ".glb"
+
             if not os.path.isfile(module_path):
-                # Fallback to exporting the base GLB
-                output_dir = PORTFOLIO_OUTPUT_DIRECTORY if props.portfolio_one_click else props.output_dir
-                os.makedirs(output_dir, exist_ok=True)
-                filename = "character.glb" if props.portfolio_one_click else (props.base_name.strip() or "character.glb")
-                filepath = os.path.join(output_dir, filename)
+                filepath = os.path.join(output_directory, filename)
                 export_character_glb(filepath, props, context)
 
-                # Generate TS helper module alongside GLB
-                ts_filepath = os.path.join(output_dir, "model_controller.ts")
+                ts_filepath = os.path.join(output_directory, "model_controller.ts")
                 with open(ts_filepath, "w", encoding="utf-8") as f:
                     f.write(typescript_module(filename, []))
 
@@ -84,11 +92,6 @@ class TJS_OT_ExportAnimations(Operator):
             exporter = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(exporter)
 
-            output_directory = PORTFOLIO_OUTPUT_DIRECTORY if props.portfolio_one_click else props.output_dir
-            filename = "character.glb" if props.portfolio_one_click else (props.base_name.strip() or "character.glb")
-            if not filename.lower().endswith(".glb"):
-                filename += ".glb"
-
             excluded = {
                 name.strip()
                 for name in re.split(r"[,;\n]+", props.exclude_actions)
@@ -97,7 +100,7 @@ class TJS_OT_ExportAnimations(Operator):
 
             exporter.OUTPUT_DIRECTORY = output_directory
             exporter.GLB_FILENAME = filename
-            exporter.EXPORT_ALL_ACTIONS = True if props.portfolio_one_click else props.export_all_actions
+            exporter.EXPORT_ALL_ACTIONS = props.export_all_actions
             exporter.ACTIONS_TO_EXCLUDE = excluded
             exporter.DECIMAL_PRECISION = props.decimal_precision
             exporter.SAMPLING_FPS = props.sampling_fps

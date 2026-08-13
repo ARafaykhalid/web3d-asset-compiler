@@ -13,19 +13,17 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup
 
-PORTFOLIO_OUTPUT_DIRECTORY = r"C:\Users\rocky\OneDrive\Documents\GitHub\portfolio\public\models"
-
 
 class TJS_Properties(PropertyGroup):
     portfolio_one_click: BoolProperty(
         name="Portfolio One-Click Export",
-        description="Export character.glb, every current Action, manifest, and binary files directly into the linked portfolio",
-        default=True,
+        description="Export character.glb, every current Action, manifest, and binary files directly into output folder",
+        default=False,
     )
     output_dir: StringProperty(
         name="Output Directory",
         subtype="DIR_PATH",
-        default=PORTFOLIO_OUTPUT_DIRECTORY,
+        default="//web3d_output",
     )
     base_name: StringProperty(
         name="GLB Filename",

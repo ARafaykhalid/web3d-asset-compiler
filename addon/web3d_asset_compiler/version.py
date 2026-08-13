@@ -1,9 +1,9 @@
 """
-Single source of truth for Web3D Asset Compiler addon versioning.
+Single source of truth for Web3D Asset Compiler addon versioning metadata.
 """
 
 VERSION = (1, 0, 0)
-VERSION_STR = ".".join(map(str, VERSION))
+VERSION_STRING = "1.0.0"
 ADDON_NAME = "Web3D Asset Compiler"
-AUTHOR = "Rocky"
+AUTHOR = "Abdul Rafay Khalid"
 BLENDER_VERSION = (5, 1, 0)

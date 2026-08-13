@@ -27,7 +27,7 @@ import traceback
 
 # Set this to False when exporting somewhere other than the linked portfolio.
 USE_PORTFOLIO_ONE_CLICK_DEFAULTS = True
-PORTFOLIO_OUTPUT_DIRECTORY = r"C:\Users\rocky\OneDrive\Documents\GitHub\portfolio\public\models"
+PORTFOLIO_OUTPUT_DIRECTORY = r"C:\Users\[YOUR_USERNAME]\[YOUR_DIRECTLY]"
 OUTPUT_DIRECTORY = PORTFOLIO_OUTPUT_DIRECTORY if USE_PORTFOLIO_ONE_CLICK_DEFAULTS else "//threejs_character/"
 GLB_FILENAME = "character.glb"
 EXPORT_ALL_ACTIONS = True

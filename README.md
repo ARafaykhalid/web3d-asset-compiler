@@ -1,6 +1,6 @@
 # Web3D Asset Compiler
 
-> Production-ready Blender addon pipeline for automated lightmap & texture baking, mesh optimization, and decoupled Three.js animation export.
+> Production-ready Blender extension pipeline for automated lightmap & texture baking, mesh optimization, and decoupled Three.js animation export.
 
 [![Blender 5.1+](https://img.shields.io/badge/Blender-5.1%2B-orange.svg)](https://www.blender.org/)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
@@ -10,7 +10,7 @@
 
 ## Overview
 
-**Web3D Asset Compiler** turns complex Blender 3D scenes into production-ready WebGL assets. It unifies high-end texture baking (**Auto HDR Baker**) and optimized web animation export (**Three.js Exporter**) into a single, installable Blender addon.
+**Web3D Asset Compiler** turns complex Blender 3D scenes into production-ready WebGL assets. It unifies high-end texture baking (**Auto HDR Baker**) and optimized web animation export (**Three.js Exporter**) into a single, installable Blender extension.
 
 ```
 Blender Scene ➔ Analyze ➔ Auto UV & Atlas ➔ Lightmap Bake ➔ Compress ➔ Decoupled Export ➔ Web 3D Asset
@@ -51,6 +51,7 @@ Designed specifically for:
 ## Supported Versions & Export Targets
 
 - **Blender Version**: 5.1.0 or higher
+- **Maintainer**: Abdul Rafay Khalid (`ARafayKhalid`)
 - **Supported Export Targets**:
   - Three.js (r150+)
   - React Three Fiber (`@react-three/fiber`)
@@ -61,11 +62,11 @@ Designed specifically for:
 
 ## Installation
 
-1. Download the latest `web3d_asset_compiler.zip` from the [Releases](https://github.com/rocky/web3d-asset-compiler/releases) page (or build it locally).
+1. Download `web3d_asset_compiler-1.0.0.zip` from [Releases](https://github.com/ARafayKhalid/web3d-asset-compiler/releases) (or build locally).
 2. Open Blender 5.1+.
-3. Navigate to **Edit ➔ Preferences ➔ Add-ons**.
-4. Click **Install...** at the top right and select `web3d_asset_compiler.zip`.
-5. Check the box to enable **Import-Export: Web3D Asset Compiler**.
+3. Navigate to **Edit ➔ Preferences ➔ Extensions** (or **Get Extensions**).
+4. Click the top-right menu and select **Install from Disk...**
+5. Select `web3d_asset_compiler-1.0.0.zip` and enable the extension.
 6. Access the panel in the 3D Viewport N-Panel under the **Web3D** tab or in **Properties ➔ Render**.
 
 ---
@@ -76,7 +77,7 @@ Designed specifically for:
 2. **Open Web3D Sidebar**: Press `N` in the 3D Viewport and click the **Web3D** tab.
 3. **Choose Preset**: Select a target preset (e.g., `⚡ React Three Fiber (R3F) Optimized`).
 4. **Click Build Web Asset**: Click **⚡ BUILD WEB ASSET (Full Pipeline)**.
-5. **View Output**: The addon will automatically unwrap, pack UVs, bake lightmaps, apply pre-lit shaders, compress the geometry, and write the output files into your specified output folder.
+5. **View Output**: The extension will automatically unwrap, pack UVs, bake lightmaps, apply pre-lit shaders, compress the geometry, and write the output files into your specified output folder.
 
 ---
 
@@ -91,14 +92,15 @@ web3d-asset-compiler/
 ├── .gitignore                  # Git ignore rules
 │
 ├── addon/
-│   └── web3d_asset_compiler/   # Complete installable Blender addon package
-│       ├── __init__.py         # Addon entrypoint & bl_info metadata
-│       ├── version.py          # Single source of truth for versioning (v1.0.0)
-│       ├── baking/             # Auto HDR Baker system (properties, pipeline, operators, JSON)
-│       ├── exporter/           # Three.js Exporter system (binary, character, quarantine, TS gen)
-│       ├── presets/            # Optimization preset definitions & operators
-│       ├── ui/                 # 3D Viewport N-Panel & Properties Render panel
-│       └── utils/              # Mesh, UV, and logging utility modules
+│   └── web3d_asset_compiler/   # Complete installable Blender extension package
+│       ├── blender_manifest.toml# Official Blender extension manifest
+│       ├── __init__.py         # Addon entrypoint
+│       ├── version.py          # Version metadata (v1.0.0, Abdul Rafay Khalid)
+│       ├── baking/             # Auto HDR Baker system
+│       ├── exporter/           # Three.js Exporter system
+│       ├── presets/            # Optimization preset definitions
+│       ├── ui/                 # 3D Viewport N-Panel & Render panel
+│       └── utils/              # Mesh, UV, and logging utilities
 │
 ├── docs/                       # In-depth technical guides
 │   ├── installation.md
@@ -106,46 +108,38 @@ web3d-asset-compiler/
 │   ├── baking.md
 │   ├── exporting.md
 │   ├── presets.md
-│   └── architecture.md
+│   ├── architecture.md
+│   └── blender-extensions-submission.md
 │
 ├── examples/                   # Web integration code examples (R3F & Three.js)
 │   ├── sample_r3f_component.tsx
 │   └── sample_threejs_loader.ts
 │
-├── scripts/                    # Build & repository validation tooling
-│   ├── build_addon.py          # Packages dist/web3d_asset_compiler.zip
-│   └── validate_addon.py       # Validates syntax, package layout, and metadata
+├── scripts/                    # Extension build & validation tooling
+│   ├── build_extension.py      # Packages dist/web3d_asset_compiler-1.0.0.zip
+│   └── validate_extension.py   # Validates TOML manifest, syntax, and cleanliness
 │
 └── tests/                      # Automated Python and headless Blender tests
     ├── test_package_structure.py
+    ├── test_extension_manifest.py
     └── test_blender_addon_register.py
 ```
 
 ---
 
-## Third-Party Integrations & Degradation
-
-| Feature / Dependency | Built-in Fallback |
-| :--- | :--- |
-| **UV Island Packing** | Integrates with **UVPackmaster 2/3**; falls back to Blender native `uv.pack_islands` if UVPackmaster is not installed. |
-| **GPU Acceleration** | Auto-detects NVIDIA OptiX/CUDA, AMD HIP, Intel oneAPI, Metal; falls back gracefully to CPU Cycles rendering. |
-| **Draco Mesh Compression** | Supported via Blender's built-in glTF exporter; user warning provided if Draco binaries are unavailable. |
-
----
-
 ## Building from Source
 
-To package the installable ZIP file from source:
+To package the installable Extension ZIP file:
 
 ```bash
-python scripts/build_addon.py
+python scripts/build_extension.py
 ```
 
 Output archive:
-`dist/web3d_asset_compiler.zip`
+`dist/web3d_asset_compiler-1.0.0.zip`
 
 ---
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0 (GPL-3.0-or-later)** to remain fully compliant with Blender's licensing model. See the [LICENSE](LICENSE) file for complete details and third-party attributions.
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0-or-later)**. See [LICENSE](LICENSE) for complete details.

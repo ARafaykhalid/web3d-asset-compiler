@@ -1,6 +1,6 @@
 bl_info = {
     "name": "Three.js Binary Animation Exporter",
-    "author": "Rocky",
+    "author": "Abdul Rafay Khalid",
     "version": (2, 2, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Three.js",
@@ -20,8 +20,7 @@ from bpy.props import (
 from bpy.types import Operator, Panel, PropertyGroup
 
 
-PORTFOLIO_OUTPUT_DIRECTORY = r"C:\Users\rocky\OneDrive\Documents\GitHub\portfolio\public\models"
-
+PORTFOLIO_OUTPUT_DIRECTORY = r"C:\Users\[YOUR_USERNAME]\[YOUR_DIRECTORY]"
 
 def _safe_base_name(value):
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())

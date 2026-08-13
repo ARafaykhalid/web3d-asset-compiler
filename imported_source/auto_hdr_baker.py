@@ -7,7 +7,7 @@
 
 bl_info = {
     "name": "Auto HDR Baker",
-    "author": "Rocky",
+    "author": "Abdul Rafay Khalid",
     "version": (3, 1, 1),
     "blender": (5, 1, 0),
     "location": "N-Panel > HDR Baker  |  Properties > Render > Auto HDR Baker",
