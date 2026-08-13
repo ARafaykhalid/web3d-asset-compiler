@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 id = "web3d_asset_compiler"
 version = "1.0.0"
 name = "Web3D Asset Compiler"
-tagline = "Unified lightmap baking, mesh optimization, and Three.js animation export pipeline"
+tagline = "Lightmap baking, mesh optimization, and Three.js export"
 maintainer = "Abdul Rafay Khalid <abdulrafaykhalid@gmail.com>"
 type = "add-on"
 blender_version_min = "5.1.0"
@@ -17,4 +17,4 @@ tags = [
 ]
 
 [permissions]
-files = "Reads and writes baked texture maps, exported GLB models, binary animation files, and JSON settings to local output directories"
+files = "Reads and writes baked textures, GLBs, animations, and presets"

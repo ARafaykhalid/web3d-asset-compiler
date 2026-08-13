@@ -1,6 +1,7 @@
 """
 Blender Extension Platform Submission Validator.
 Checks blender_manifest.toml schema, SPDX licenses, file structure, version consistency,
+character length limits (tagline <= 64 chars, permissions reasons <= 64 chars),
 and absence of hardcoded local machine paths or forbidden development files.
 """
 
@@ -48,6 +49,7 @@ def parse_toml(file_path):
             return tomllib.load(f)
     
     data = {}
+    current_section = None
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -55,15 +57,22 @@ def parse_toml(file_path):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if "=" in line and not line.startswith("["):
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1].strip()
+            if current_section not in data:
+                data[current_section] = {}
+            continue
+        if "=" in line:
             key, val = line.split("=", 1)
             key = key.strip()
             val = val.strip().strip('"').strip("'")
             if val.startswith("[") and val.endswith("]"):
                 items = [x.strip().strip('"').strip("'") for x in val[1:-1].split(",") if x.strip()]
-                data[key] = items
+                target = data[current_section] if current_section else data
+                target[key] = items
             else:
-                data[key] = val
+                target = data[current_section] if current_section else data
+                target[key] = val
     return data
 
 
@@ -129,6 +138,17 @@ def validate_extension():
             else:
                 print(f"  [OK] {key} = '{val}'")
 
+        # Validate Tagline Length (<= 64 chars)
+        tagline = manifest.get("tagline", "")
+        if not tagline:
+            errors.append("Manifest missing 'tagline'")
+            print("  [X] Missing tagline")
+        elif len(tagline) > 64:
+            errors.append(f"Tagline is too long ({len(tagline)} chars). Maximum length is 64 chars.")
+            print(f"  [X] Tagline too long ({len(tagline)} chars > 64): '{tagline}'")
+        else:
+            print(f"  [OK] tagline ({len(tagline)} chars <= 64) = '{tagline}'")
+
         # Validate Maintainer
         maintainer = manifest.get("maintainer", "")
         if not maintainer or "@" not in str(maintainer):
@@ -154,6 +174,16 @@ def validate_extension():
             print(f"  [X] Missing or invalid tags list: {tags}")
         else:
             print(f"  [OK] tags = {tags}")
+
+        # Validate Permissions reasons (<= 64 chars)
+        permissions = manifest.get("permissions", {})
+        if isinstance(permissions, dict):
+            for perm, reason in permissions.items():
+                if len(str(reason)) > 64:
+                    errors.append(f"Permission '{perm}' reason is too long ({len(str(reason))} chars). Max length is 64 chars.")
+                    print(f"  [X] Permission '{perm}' reason too long ({len(str(reason))} chars > 64)")
+                else:
+                    print(f"  [OK] permission '{perm}' ({len(str(reason))} chars <= 64) = '{reason}'")
 
     # 3. Check Version Consistency
     if os.path.isfile(VERSION_PY_PATH) and os.path.isfile(MANIFEST_PATH):
