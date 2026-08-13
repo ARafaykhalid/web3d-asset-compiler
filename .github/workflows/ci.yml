@@ -1,0 +1,38 @@
+name: CI - Addon Validation & Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate Addon Code & Syntax
+        run: |
+          python scripts/validate_addon.py
+
+      - name: Run Package Structure Unit Tests
+        run: |
+          python -m unittest discover -s tests
+
+      - name: Build Installable Addon ZIP
+        run: |
+          python scripts/build_addon.py
+
+      - name: Upload Addon Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web3d_asset_compiler_zip
+          path: dist/web3d_asset_compiler.zip

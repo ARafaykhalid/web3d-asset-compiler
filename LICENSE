@@ -1,0 +1,44 @@
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
+
+Copyright (C) 2026 Web3D Asset Compiler Contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+----------------------------------------------------------------------
+THIRD-PARTY DEPENDENCIES AND ATTRIBUTIONS
+----------------------------------------------------------------------
+
+This project interacts with and integrates optional features from the
+following third-party tools, libraries, and specifications:
+
+1. Blender glTF 2.0 Exporter (io_scene_gltf2)
+   - Used for scene geometry, armature, and material export.
+   - License: GPL-2.0-or-later / GPL-3.0-or-later
+   - Source: https://github.com/KhronosGroup/glTF-Blender-IO
+
+2. Three.js / WebGL Ecosystem
+   - Target rendering framework for exported models, binary animations, and generated TypeScript helpers.
+   - License: MIT License
+   - Website: https://threejs.org / https://github.com/mrdoob/three.js
+
+3. Draco Mesh Compression (Google Draco)
+   - Optional 3D geometry compression library supported during GLB export.
+   - License: Apache License 2.0
+   - Repository: https://github.com/google/draco
+
+4. UVPackmaster 2 / 3 (Optional Third-Party Addon)
+   - Optional external UV island packing engine integration.
+   - If unavailable, Web3D Asset Compiler gracefully falls back to Blender's native packing algorithms.
+   - Website: https://uvpackmaster.com
