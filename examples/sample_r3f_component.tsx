@@ -1,33 +1,50 @@
-import React, { useEffect, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
-import { useGLTF, useAnimations } from '@react-three/drei';
-import * as THREE from 'three';
+import { useEffect, useRef, useState } from 'react';
+import type * as THREE from 'three';
+
+import {
+  loadAnimatedModel,
+  type AnimatedModelController,
+} from './generated/model_controller.js';
 
 export interface ModelProps {
-  url?: string;
   activeAnimation?: string;
 }
 
-export const Web3DModel: React.FC<ModelProps> = ({
-  url = '/models/character.glb',
+export function Web3DModel({
   activeAnimation = 'Idle',
-}) => {
-  const groupRef = useRef<THREE.Group>(null);
-  const { scene, animations } = useGLTF(url);
-  const { actions } = useAnimations(animations, groupRef);
+}: ModelProps) {
+  const controllerRef = useRef<AnimatedModelController | null>(null);
+  const [root, setRoot] = useState<THREE.Group | null>(null);
 
   useEffect(() => {
-    if (!actions || !activeAnimation) return;
-    const action = actions[activeAnimation];
-    if (action) {
-      action.reset().fadeIn(0.3).play();
-      return () => {
-        action.fadeOut(0.3);
-      };
-    }
-  }, [actions, activeAnimation]);
+    let cancelled = false;
 
-  return <primitive ref={groupRef} object={scene} dispose={null} />;
-};
+    void loadAnimatedModel().then((controller) => {
+      if (cancelled) {
+        controller.dispose();
+        return;
+      }
+      controllerRef.current = controller;
+      setRoot(controller.root);
+    });
 
-useGLTF.preload('/models/character.glb');
+    return () => {
+      cancelled = true;
+      controllerRef.current?.dispose();
+      controllerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!controller || !activeAnimation) return;
+    void controller.play(activeAnimation);
+  }, [activeAnimation, root]);
+
+  useFrame((_state, deltaSeconds) => {
+    controllerRef.current?.update(deltaSeconds);
+  });
+
+  return root ? <primitive object={root} /> : null;
+}

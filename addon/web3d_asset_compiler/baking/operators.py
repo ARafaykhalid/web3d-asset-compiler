@@ -43,6 +43,11 @@ from .pipeline import (
     ensure_uv,
     atlas_pack_phase,
     pack_uv_islands_phased,
+    force_object_mode,
+    force_ui_redraw,
+    uses_image_bake_target,
+    bake_type_needs_uv,
+    ensure_bake_color_attribute,
     IMAGE_UV_BACKUP_PROP,
     IMAGE_UV_BACKUP_LAYER,
 )
@@ -203,8 +208,8 @@ class AHB_OT_BakeAll(Operator):
         def work():
             return run_bake(obj_names, props, context, self.report, source_names)
 
-        baked, _errors = save_and_restore_selection(context, work)
-        return {'FINISHED'} if baked else {'CANCELLED'}
+        baked, errors = save_and_restore_selection(context, work)
+        return {'FINISHED'} if baked and not errors else {'CANCELLED'}
 
 
 class AHB_OT_RebakeSelected(Operator):
@@ -227,50 +232,77 @@ class AHB_OT_RebakeSelected(Operator):
             return {'CANCELLED'}
 
         obj_names = [obj.name]
+        cage_object = (getattr(props, 'cage_object', None)
+                       if getattr(props, 'use_cage', False) else None)
         source_names = [o.name for o in context.selected_objects
-                        if o.type == 'MESH' and o != obj and o.data.polygons]
+                        if (o.type == 'MESH' and o != obj and o != cage_object
+                            and o.data.polygons)]
 
         def work():
             restore_material_backups(obj_names)
-            prepare_mesh_data(obj_names, make_unique=props.auto_create_uv)
+            prepare_mesh_data(
+                obj_names,
+                make_unique=(props.auto_create_uv
+                             or not uses_image_bake_target(props)))
             prepare_material_slots(obj_names)
             preserve_implicit_texture_uvs(obj_names, props)
 
-            if props.uv_layer_name not in obj.data.uv_layers:
+            if (bake_type_needs_uv(props)
+                    and props.uv_layer_name not in obj.data.uv_layers):
                 if props.image_mode in ('ATLAS', 'AUTO_TILES', 'COLLECTION_ATLASES'):
                     setup_atlas_uvs(obj_names, props)
                 else:
                     ensure_uv(obj.name, props)
 
             target_images = {}
-            for slot in obj.material_slots:
-                mat = slot.material
-                if not mat:
-                    continue
-                image = get_object_bake_image(
-                    obj, props, mat if props.image_mode == 'PER_MATERIAL' else None)
-                if image:
-                    target_images[mat.name] = image
-                    inject_bake_node(mat.name, image, props.image_node_name)
+            if uses_image_bake_target(props):
+                had_recorded_assignment = bool(obj.get("ahb_baked_texture"))
+                for slot in obj.material_slots:
+                    mat = slot.material
+                    if not mat:
+                        continue
+                    image = get_object_bake_image(
+                        obj, props,
+                        mat if props.image_mode == 'PER_MATERIAL' else None)
+                    if image:
+                        target_images[mat.name] = image
+                        inject_bake_node(mat.name, image, props.image_node_name)
 
-            if not target_images:
-                raise RuntimeError("The object has no existing bake image/texture-pack assignment")
+                if not target_images:
+                    raise RuntimeError(
+                        "The object has no existing bake image/texture-pack assignment")
+                if (props.image_mode in ('AUTO_TILES', 'COLLECTION_ATLASES')
+                        and not had_recorded_assignment):
+                    raise RuntimeError(
+                        "This object has no recorded texture-pack assignment; "
+                        "run a full bake first")
+            elif not ensure_bake_color_attribute(obj):
+                raise RuntimeError("The object cannot store a bake color attribute")
+
             if not validate_bake_ready(obj_names, props, self.report):
                 return False
 
             configure_bake_settings(props, context)
             context.scene.render.bake.use_clear = False
             props.status_text = f"Rebaking {obj.name} in its existing texture pack…"
+            force_ui_redraw()
 
             do_bake_batch(obj_names, props, context, source_names)
 
-            if props.auto_save:
+            if (uses_image_bake_target(props) and props.auto_save
+                    and getattr(props, 'save_mode', 'EXTERNAL') == 'EXTERNAL'):
                 for image in {image.name: image for image in target_images.values()}.values():
                     if image.has_data:
                         save_image(image, props, context)
 
-            if props.auto_cleanup_nodes:
+            if uses_image_bake_target(props) and props.auto_cleanup_nodes:
                 remove_bake_nodes(set(target_images), props.image_node_name)
+
+            applied = apply_single_object_bake(
+                obj, props, resolve_apply_mode(props), self.report)
+            if applied == 0:
+                raise RuntimeError(
+                    "Rebake finished, but no baked material could be applied")
 
             props.baked_view = True
             props.status_text = f"Rebaked {obj.name} in its existing texture pack."
@@ -279,6 +311,7 @@ class AHB_OT_RebakeSelected(Operator):
         try:
             ok = save_and_restore_selection(context, work)
         except Exception as e:
+            print(f"[AHB] Selected rebake error:\n{traceback.format_exc()}")
             props.status_text = f"Selected rebake failed: {e}"
             self.report({'ERROR'}, f"Selected rebake failed: {e}")
             return {'CANCELLED'}
@@ -324,7 +357,14 @@ class AHB_OT_QuickBake(Operator):
                 return False
 
             props.status_text = "Applying baked textures…"
-            run_apply(obj_names, props, self.report)
+            applied, skipped = run_apply(obj_names, props, self.report)
+            if applied == 0 or skipped:
+                props.status_text = (
+                    f"Material application incomplete — {applied} applied, "
+                    f"{skipped} skipped"
+                )
+                self.report({'ERROR'}, props.status_text)
+                return False
 
             if props.auto_rename_objects:
                 rename_objects_by_texture(obj_names, props, self.report)
@@ -428,7 +468,13 @@ class AHB_OT_SaveImages(Operator):
     def execute(self, context):
         props = context.scene.ahb_props
         normalize_core_names(props)
+        if not uses_image_bake_target(props):
+            self.report(
+                {'INFO'},
+                "Color attribute bakes are stored on the mesh and saved with the blend file.")
+            return {'FINISHED'}
         saved = 0
+        failed = 0
 
         for img in bpy.data.images:
             if img.name.startswith(props.output_prefix) and img.has_data:
@@ -437,10 +483,11 @@ class AHB_OT_SaveImages(Operator):
                     saved += 1
                     self.report({'INFO'}, f"Saved: {path}")
                 except Exception as e:
+                    failed += 1
                     self.report({'WARNING'}, f"Save failed [{img.name}]: {e}")
 
-        self.report({'INFO'}, f"Saved {saved} image(s).")
-        return {'FINISHED'}
+        self.report({'INFO'}, f"Saved {saved} image(s); failed: {failed}.")
+        return {'FINISHED'} if saved and not failed else {'CANCELLED'}
 
 
 class AHB_OT_RenewAutoSeams(Operator):
@@ -458,6 +505,23 @@ class AHB_OT_RenewAutoSeams(Operator):
 
         count = clear_and_renew_auto_seams(obj_names, props)
         setup_atlas_uvs(obj_names, props)
+
+        force_object_mode()
+        bpy.ops.object.select_all(action='DESELECT')
+        first_obj = None
+        for obj_name in obj_names:
+            obj = bpy.data.objects.get(obj_name)
+            if obj and obj.type == 'MESH':
+                obj.select_set(True)
+                if first_obj is None:
+                    first_obj = obj
+        if first_obj:
+            context.view_layer.objects.active = first_obj
+            try:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+            except Exception:
+                pass
 
         msg = f"Renewed auto seams & re-unwrapped {count} object(s)."
         props.status_text = msg
@@ -478,15 +542,108 @@ class AHB_OT_PreviewUV(Operator):
             self.report({'WARNING'}, "No valid mesh objects in scope.")
             return {'CANCELLED'}
 
+        force_object_mode()
         image_mode = props.image_mode
+        layer_name = props.uv_layer_name
 
         if image_mode == 'ATLAS':
-            setup_atlas_uvs(obj_names, props)
-            self.report({'INFO'}, f"Atlas UV layout created for {len(obj_names)} object(s).")
+            try:
+                remove_tile_uv_offsets(obj_names, layer_name)
+                setup_atlas_uvs(obj_names, props)
+                self.report(
+                    {'INFO'},
+                    f"Atlas UV layout created for {len(obj_names)} object(s).")
+            except Exception as e:
+                self.report({'WARNING'}, f"Atlas UV preview failed: {e}")
+                print(f"[AHB] Atlas UV preview error:\n{traceback.format_exc()}")
+                force_object_mode()
+
+        elif image_mode == 'AUTO_TILES':
+            remove_tile_uv_offsets(obj_names, layer_name)
+            tiles = distribute_tiles(obj_names, props.tile_count)
+            succeeded = 0
+            tile_info = []
+            for tile_idx, tile_obj_names in enumerate(tiles):
+                try:
+                    setup_atlas_uvs(tile_obj_names, props)
+                    offset_tile_uvs(tile_obj_names, tile_idx, layer_name)
+                    succeeded += 1
+                    tile_info.append(
+                        f"Tile {tile_idx + 1}: {len(tile_obj_names)} obj(s)")
+                except Exception as e:
+                    self.report(
+                        {'WARNING'},
+                        f"Tile {tile_idx + 1} UV preview failed: {e}")
+                    print(
+                        f"[AHB] Tile {tile_idx + 1} UV preview error:\n"
+                        f"{traceback.format_exc()}")
+                    force_object_mode()
+            info = " | ".join(tile_info)
+            self.report(
+                {'INFO'},
+                f"UV preview: {succeeded} tile(s) side-by-side. {info}")
+
+        elif image_mode == 'COLLECTION_ATLASES':
+            remove_tile_uv_offsets(obj_names, layer_name)
+            groups = get_atlas_groups(obj_names, props, self.report)
+            succeeded = 0
+            atlas_info = []
+            for atlas_idx, (atlas_number, atlas_obj_names) in enumerate(groups):
+                if not atlas_obj_names:
+                    continue
+                try:
+                    setup_atlas_uvs(atlas_obj_names, props)
+                    offset_tile_uvs(atlas_obj_names, atlas_idx, layer_name)
+                    succeeded += 1
+                    atlas_name = get_collection_atlas_name(props, atlas_number)
+                    atlas_info.append(
+                        f"{atlas_name}: {len(atlas_obj_names)} obj(s)")
+                except Exception as e:
+                    self.report(
+                        {'WARNING'}, f"Atlas {atlas_number} UV preview failed: {e}")
+                    print(
+                        f"[AHB] Collection atlas {atlas_number} preview error:\n"
+                        f"{traceback.format_exc()}")
+                    force_object_mode()
+            info = " | ".join(atlas_info)
+            self.report(
+                {'INFO'},
+                f"Collection atlas preview: {succeeded} group(s). {info}")
+
         elif image_mode == 'PER_MATERIAL':
-            for obj_name in obj_names:
-                ensure_uv(obj_name, props)
-            self.report({'INFO'}, f"UV layers created for {len(obj_names)} object(s).")
+            succeeded = 0
+            if props.auto_create_uv:
+                for obj_name in obj_names:
+                    try:
+                        ensure_uv(obj_name, props)
+                        succeeded += 1
+                    except Exception as e:
+                        self.report({'WARNING'}, f"UV setup failed [{obj_name}]: {e}")
+                        force_object_mode()
+            self.report(
+                {'INFO'},
+                f"UV layers created/updated for {succeeded}/{len(obj_names)} object(s).")
+
+        force_object_mode()
+        bpy.ops.object.select_all(action='DESELECT')
+        first_obj = None
+        for obj_name in obj_names:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj or obj.type != 'MESH':
+                continue
+            obj.select_set(True)
+            if first_obj is None:
+                first_obj = obj
+            if layer_name in obj.data.uv_layers:
+                obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
+
+        if first_obj:
+            context.view_layer.objects.active = first_obj
+            try:
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.mesh.select_all(action='SELECT')
+            except Exception:
+                pass
 
         return {'FINISHED'}
 
@@ -504,13 +661,86 @@ class AHB_OT_PackIslands(Operator):
             self.report({'WARNING'}, "No valid mesh objects in scope.")
             return {'CANCELLED'}
 
-        if props.image_mode in ('ATLAS', 'AUTO_TILES', 'COLLECTION_ATLASES'):
-            atlas_pack_phase(obj_names, props)
-        else:
-            for obj_name in obj_names:
-                pack_uv_islands_phased(obj_name, props)
+        force_object_mode()
+        image_mode = props.image_mode
+        layer_name = props.uv_layer_name
 
-        self.report({'INFO'}, f"Packed islands for {len(obj_names)} object(s).")
+        if image_mode in ('ATLAS', 'AUTO_TILES', 'COLLECTION_ATLASES'):
+            valid = []
+            for obj_name in obj_names:
+                obj = bpy.data.objects.get(obj_name)
+                if not obj or obj.type != 'MESH' or not obj.data.polygons:
+                    continue
+                if layer_name not in obj.data.uv_layers:
+                    self.report(
+                        {'WARNING'}, f"{obj_name}: No UV layer '{layer_name}'.")
+                    continue
+                valid.append(obj_name)
+            if not valid:
+                self.report({'WARNING'}, "No objects with valid UV layers.")
+                return {'CANCELLED'}
+
+            if image_mode == 'ATLAS':
+                remove_tile_uv_offsets(valid, layer_name)
+                try:
+                    atlas_pack_phase(valid, props)
+                except Exception as e:
+                    self.report({'WARNING'}, f"Atlas pack failed: {e}")
+                    print(f"[AHB] Atlas pack error:\n{traceback.format_exc()}")
+                    force_object_mode()
+            elif image_mode == 'AUTO_TILES':
+                remove_tile_uv_offsets(valid, layer_name)
+                for tile_idx, tile_objs in enumerate(
+                        distribute_tiles(valid, props.tile_count)):
+                    try:
+                        atlas_pack_phase(tile_objs, props)
+                    except Exception as e:
+                        self.report(
+                            {'WARNING'}, f"Tile {tile_idx + 1} pack failed: {e}")
+                        force_object_mode()
+            else:
+                remove_tile_uv_offsets(valid, layer_name)
+                for atlas_number, atlas_objs in get_atlas_groups(
+                        valid, props, self.report):
+                    if not atlas_objs:
+                        continue
+                    try:
+                        atlas_pack_phase(atlas_objs, props)
+                    except Exception as e:
+                        self.report(
+                            {'WARNING'}, f"Atlas {atlas_number} pack failed: {e}")
+                        force_object_mode()
+
+            msg = (
+                f"Packed islands across {len(valid)} object(s) "
+                f"({props.pack_margin_px}px margin, "
+                f"{props.pack_iterations} iterations)")
+        else:
+            packed = 0
+            for obj_name in obj_names:
+                obj = bpy.data.objects.get(obj_name)
+                if not obj or obj.type != 'MESH' or not obj.data.polygons:
+                    continue
+                if layer_name not in obj.data.uv_layers:
+                    self.report(
+                        {'WARNING'}, f"{obj_name}: No UV layer '{layer_name}'.")
+                    continue
+                try:
+                    pack_uv_islands_phased(obj_name, props)
+                    packed += 1
+                except Exception as e:
+                    self.report({'WARNING'}, f"Pack failed [{obj_name}]: {e}")
+                    print(
+                        f"[AHB] Pack error for {obj_name}:\n"
+                        f"{traceback.format_exc()}")
+                    force_object_mode()
+            msg = (
+                f"Packed islands on {packed} object(s) "
+                f"({props.pack_margin_px}px margin, "
+                f"{props.pack_iterations} iterations)")
+
+        props.status_text = msg
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -543,25 +773,41 @@ class AHB_OT_RemoveUnusedMaterials(Operator):
 
     def execute(self, context):
         props     = context.scene.ahb_props
-        obj_names = get_object_names(props, context)
+        obj_names = get_object_names(props, context, include_empty=True)
         if not obj_names:
             self.report({'WARNING'}, "No valid mesh objects in scope.")
             return {'CANCELLED'}
 
+        force_object_mode()
         total_removed = 0
         for obj_name in obj_names:
             obj = bpy.data.objects.get(obj_name)
-            if not obj or obj.type != 'MESH': continue
+            if not obj or obj.type != 'MESH':
+                continue
 
-            used_indices = {poly.material_index for poly in obj.data.polygons}
-            slots_to_remove = [idx for idx in range(len(obj.material_slots)) if idx not in used_indices]
+            mesh = obj.data
+            context.view_layer.objects.active = obj
+            if not mesh.polygons:
+                while obj.material_slots:
+                    obj.active_material_index = 0
+                    bpy.ops.object.material_slot_remove()
+                    total_removed += 1
+                continue
+
+            used_indices = {poly.material_index for poly in mesh.polygons}
+            slots_to_remove = [
+                idx for idx in range(len(obj.material_slots))
+                if idx not in used_indices
+            ]
 
             for idx in reversed(slots_to_remove):
                 obj.active_material_index = idx
                 bpy.ops.object.material_slot_remove()
                 total_removed += 1
 
-        self.report({'INFO'}, f"Removed {total_removed} unused material slot(s).")
+        msg = f"Removed {total_removed} unused material slot(s)."
+        props.status_text = msg
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -578,9 +824,9 @@ class AHB_OT_ApplyBakedTextures(Operator):
             self.report({'WARNING'}, "No valid mesh objects in scope.")
             return {'CANCELLED'}
 
-        run_apply(obj_names, props, self.report)
-        props.baked_view = True
-        return {'FINISHED'}
+        applied, skipped = run_apply(obj_names, props, self.report)
+        props.baked_view = applied > 0
+        return {'FINISHED'} if applied else {'CANCELLED'}
 
 
 class AHB_OT_ToggleBakedView(Operator):
@@ -599,10 +845,13 @@ class AHB_OT_ToggleBakedView(Operator):
         if scope_has_material_backups(obj_names):
             restored = restore_material_backups(obj_names)
             props.baked_view = False
-            self.report({'INFO'}, f"Showing original materials ({restored} restored).")
+            props.status_text = f"Showing original materials ({restored} restored)."
+            self.report({'INFO'}, props.status_text)
         else:
-            run_apply(obj_names, props, self.report)
-            props.baked_view = True
+            applied, skipped = run_apply(obj_names, props, self.report)
+            props.baked_view = applied > 0
+            if applied == 0 and skipped:
+                return {'CANCELLED'}
         return {'FINISHED'}
 
 

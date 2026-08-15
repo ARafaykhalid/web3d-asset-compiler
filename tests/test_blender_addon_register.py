@@ -40,6 +40,7 @@ class TestBlenderAddonRegister(unittest.TestCase):
         # Verify operators in Blender
         expected_operators = [
             "web3d.build_web_asset",
+            "web3d.apply_preset",
             "ahb.quick_bake",
             "ahb.bake_all",
             "ahb.rebake_selected",
@@ -54,9 +55,15 @@ class TestBlenderAddonRegister(unittest.TestCase):
             "ahb.cleanup_images",
             "ahb.export_materials_json",
             "ahb.import_materials_json",
+            "ahb.delete_old_uv_maps",
+            "ahb.remove_all_uv_maps",
+            "ahb.save_images",
+            "ahb.remove_unused_materials",
+            "ahb.create_atlas_collections",
+            "ahb.group_to_collections",
+            "ahb.rename_objects",
             "tjs.export_character_glb",
             "tjs.export_animations",
-            "web3d.apply_preset",
         ]
 
         missing = []

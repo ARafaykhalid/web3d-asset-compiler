@@ -9,6 +9,7 @@ from bpy.props import (
     FloatProperty,
     StringProperty,
     EnumProperty,
+    PointerProperty,
 )
 from bpy.types import PropertyGroup
 
@@ -207,11 +208,10 @@ class AHB_Properties(PropertyGroup):
     )
     pack_rotate: BoolProperty(name="Allow Rotation", default=True)
     pack_rotation_step: EnumProperty(
-        name="Rotation Step",
+        name="Rotation Mode",
         items=[
             ('ANY',  'Any Angle',  'Fully free rotation for maximum density'),
-            ('90',   '90°',        'Only 0°/90°/180°/270° rotations'),
-            ('45',   '45°',        '45° step rotations'),
+            ('AXIS_ALIGNED', 'Axis Aligned', 'Align islands to their principal axes'),
             ('NONE', 'No Rotation', 'Keep original orientation'),
         ],
         default='ANY',
@@ -274,10 +274,52 @@ class AHB_Properties(PropertyGroup):
     )
     device_status: StringProperty(name="Active Device", default="Configured when baking starts")
 
-    # Selected-to-Active
+    # Selected-to-Active & Cage
     use_selected_to_active: BoolProperty(name="Selected to Active", default=False)
     cage_extrusion:         FloatProperty(name="Cage Extrusion", default=0.02, min=0, max=1)
     max_ray_distance:       FloatProperty(name="Max Ray Distance", default=0.0, min=0, max=10)
+    use_cage:               BoolProperty(name="Use Custom Cage", default=False, description="Use a custom cage object for distance casting")
+    cage_object:            PointerProperty(type=bpy.types.Object, name="Cage Object", description="Custom cage mesh object")
+
+    # Normal Map Controls
+    denoise_bake: BoolProperty(
+        name="Denoise Baked Textures",
+        default=False,
+        description="Reserved for compatibility; Cycles does not denoise bake targets",
+        options={'HIDDEN'},
+    )
+    normal_space: EnumProperty(
+        name="Normal Space",
+        items=[
+            ('TANGENT', 'Tangent Space', 'Standard tangent space normal map for PBR shaders'),
+            ('OBJECT',  'Object Space',  'Object space normal map'),
+        ],
+        default='TANGENT',
+    )
+    normal_r: EnumProperty(name="Axis X", items=[('POS_X', '+X', ''), ('NEG_X', '-X', '')], default='POS_X')
+    normal_g: EnumProperty(name="Axis Y", items=[('POS_Y', '+Y', ''), ('NEG_Y', '-Y', '')], default='POS_Y')
+    normal_b: EnumProperty(name="Axis Z", items=[('POS_Z', '+Z', ''), ('NEG_Z', '-Z', '')], default='POS_Z')
+    multires_bake: BoolProperty(
+        name="Bake from Multires",
+        default=False,
+        description="Bake a Normal map from an object's Multiresolution modifier",
+    )
+    bake_target: EnumProperty(
+        name="Target Output",
+        items=[
+            ('IMAGE_TEXTURES', 'Image Textures', 'Bake to image textures'),
+            ('VERTEX_COLORS', 'Color Attributes', 'Bake directly to mesh vertex colors'),
+        ],
+        default='IMAGE_TEXTURES',
+    )
+    save_mode: EnumProperty(
+        name="Save Mode",
+        items=[
+            ('EXTERNAL', 'Save Files to Disk', 'Save baked images directly to output directory'),
+            ('INTERNAL', 'Keep in Blend File', 'Keep images internal to .blend file'),
+        ],
+        default='EXTERNAL',
+    )
 
     # Output
     output_dir:    StringProperty(name="Output Directory", subtype='DIR_PATH', default="//baked/")

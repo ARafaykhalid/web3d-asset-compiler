@@ -3,6 +3,8 @@ F-curve quarantine and safety utilities for Blender 5.1 slotted Actions.
 Prevents Blender's glTF exporter from crashing on invalid array index F-curves.
 """
 
+import re
+
 import bpy
 
 TARGET_LENGTHS = {
@@ -17,6 +19,13 @@ TARGET_LENGTHS = {
     "scale": 3,
     "value": 1,
 }
+
+_BONE_TRANSFORM_RE = re.compile(
+    r'^pose\.bones\["(?:\\.|[^"])*"\]\.(?P<target>[A-Za-z_]+)$'
+)
+_SHAPE_KEY_VALUE_RE = re.compile(
+    r'^key_blocks\["(?:\\.|[^"])*"\]\.value$'
+)
 
 
 def iter_action_fcurve_collections(action):
@@ -36,40 +45,94 @@ def iter_action_fcurve_collections(action):
         pass
 
 
+def _target_length(data_path):
+    if data_path in TARGET_LENGTHS and data_path != "value":
+        return TARGET_LENGTHS[data_path]
+
+    bone_match = _BONE_TRANSFORM_RE.fullmatch(data_path)
+    if bone_match:
+        return TARGET_LENGTHS.get(bone_match.group("target"))
+
+    if _SHAPE_KEY_VALUE_RE.fullmatch(data_path):
+        return TARGET_LENGTHS["value"]
+    return None
+
+
 def is_unsafe_fcurve(fcurve):
-    """Match the component lengths used internally by Blender's glTF exporter."""
-    target = fcurve.data_path.rsplit(".", 1)[-1]
-    if target.startswith("["):
-        target = ""
-    target_length = TARGET_LENGTHS.get(target, 1)
+    """Return true only for malformed transform or shape-key component curves."""
+    target_length = _target_length(fcurve.data_path)
+    if target_length is None:
+        return False
     return fcurve.array_index < 0 or fcurve.array_index >= target_length
 
 
-def quarantine_unsafe_fcurves():
-    """Temporarily move glTF-crashing curves to an incompatible Action slot."""
-    quarantine = bpy.data.actions.new("__TJS_EXPORT_QUARANTINE__")
-    slot = quarantine.slots.new("SCENE", "TJS Export Quarantine")
-    layer = quarantine.layers.new("Quarantine")
-    strip = layer.strips.new(type="KEYFRAME")
-    destination = strip.channelbags.new(slot).fcurves
+def quarantine_unsafe_fcurves(actions):
+    """Temporarily move unsafe curves from the Actions used by this export."""
+    quarantine = None
     records = []
+    try:
+        quarantine = bpy.data.actions.new("__TJS_EXPORT_QUARANTINE__")
+        slot = quarantine.slots.new("SCENE", "TJS Export Quarantine")
+        layer = quarantine.layers.new("Quarantine")
+        strip = layer.strips.new(type="KEYFRAME")
+        destination = strip.channelbags.new(slot).fcurves
 
-    for action in list(bpy.data.actions):
-        if action == quarantine:
-            continue
-        for collection in iter_action_fcurve_collections(action):
-            for fcurve in list(collection):
-                if not is_unsafe_fcurve(fcurve):
-                    continue
+        for action in list(dict.fromkeys(actions)):
+            if action == quarantine:
+                continue
+            unsafe = [
+                (collection, fcurve)
+                for collection in iter_action_fcurve_collections(action)
+                for fcurve in list(collection)
+                if is_unsafe_fcurve(fcurve)
+            ]
+            if unsafe and not getattr(action, "is_editable", True):
+                raise RuntimeError(
+                    f"Linked Action '{action.name}' contains an invalid transform "
+                    "F-curve and cannot be repaired temporarily. Make it local first."
+                )
+            for collection, fcurve in unsafe:
                 copy = destination.new_from_fcurve(fcurve)
-                records.append((collection, copy, action.name, fcurve.data_path,
-                                fcurve.array_index))
+                record = (
+                    collection,
+                    copy,
+                    action.name,
+                    fcurve.data_path,
+                    fcurve.array_index,
+                )
                 collection.remove(fcurve)
-    return quarantine, records
+                records.append(record)
+        return quarantine, records
+    except Exception:
+        rollback_failed = False
+        for (
+            collection,
+            copy,
+            _action_name,
+            _data_path,
+            _array_index,
+        ) in reversed(records):
+            try:
+                collection.new_from_fcurve(copy)
+            except Exception:
+                rollback_failed = True
+        if quarantine and not rollback_failed:
+            try:
+                bpy.data.actions.remove(quarantine)
+            except Exception:
+                pass
+        raise
 
 
 def restore_quarantined_fcurves(quarantine, records):
+    restore_error = None
     for collection, copy, _action_name, _data_path, _array_index in records:
-        collection.new_from_fcurve(copy)
-    if quarantine:
+        try:
+            collection.new_from_fcurve(copy)
+        except Exception as exc:
+            if restore_error is None:
+                restore_error = exc
+    if quarantine and restore_error is None:
         bpy.data.actions.remove(quarantine)
+    if restore_error is not None:
+        raise restore_error

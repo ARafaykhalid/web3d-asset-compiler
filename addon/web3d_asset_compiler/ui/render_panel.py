@@ -3,7 +3,7 @@ Properties Editor render panel integration for Web3D Asset Compiler.
 """
 
 from bpy.types import Panel
-from .sidebar import draw_unified_ui
+from .sidebar import draw_compile_overview
 
 
 class WEB3D_PT_RenderProps(Panel):
@@ -14,4 +14,4 @@ class WEB3D_PT_RenderProps(Panel):
     bl_idname      = 'WEB3D_PT_RenderProps'
 
     def draw(self, context):
-        draw_unified_ui(self.layout, context)
+        draw_compile_overview(self.layout, context, compact=True)

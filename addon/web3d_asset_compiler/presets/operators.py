@@ -2,10 +2,20 @@
 Operator for applying Web3D compilation presets.
 """
 
-import bpy
 from bpy.types import Operator
 from bpy.props import EnumProperty
 from .preset_data import PRESETS
+
+
+def _set_properties(target, values, prefix, skipped):
+    for prop_name, value in values.items():
+        if not hasattr(target, prop_name):
+            skipped.append(f"{prefix}.{prop_name}")
+            continue
+        try:
+            setattr(target, prop_name, value)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            skipped.append(f"{prefix}.{prop_name}")
 
 
 class WEB3D_OT_ApplyPreset(Operator):
@@ -30,16 +40,19 @@ class WEB3D_OT_ApplyPreset(Operator):
             return {'CANCELLED'}
 
         ahb = context.scene.ahb_props
-        for prop_name, val in preset.get('ahb', {}).items():
-            if hasattr(ahb, prop_name):
-                setattr(ahb, prop_name, val)
+        skipped = []
+        _set_properties(ahb, preset.get('ahb', {}), "Bake", skipped)
 
         tjs = context.scene.tjs_props
-        for prop_name, val in preset.get('tjs', {}).items():
-            if hasattr(tjs, prop_name):
-                setattr(tjs, prop_name, val)
+        _set_properties(tjs, preset.get('tjs', {}), "Export", skipped)
 
         msg = f"Applied preset: {preset['label']}"
-        context.scene.web3d_status = msg
-        self.report({'INFO'}, msg)
+        context.scene.web3d_status = "Ready"
+        if skipped:
+            preview = ", ".join(skipped[:3])
+            if len(skipped) > 3:
+                preview += f", +{len(skipped) - 3} more"
+            self.report({'WARNING'}, f"{msg}. Skipped unavailable setting(s): {preview}")
+        else:
+            self.report({'INFO'}, msg)
         return {'FINISHED'}

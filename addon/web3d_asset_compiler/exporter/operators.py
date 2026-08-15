@@ -1,55 +1,108 @@
-"""
-Operator classes for Three.js Exporter within Web3D Asset Compiler.
-"""
+"""Blender operators for model-only and decoupled character export."""
 
 import os
 import re
-import json
-import importlib.util
+
 import bpy
 from bpy.types import Operator
 
+from .binary_exporter import export_character_and_animations
 from .character_exporter import export_character_glb
-from .ts_generator import typescript_module
+from .ts_generator import WINDOWS_RESERVED
+
+
+PORTFOLIO_OUTPUT_ENV = "WEB3D_PORTFOLIO_MODELS_DIR"
+
+
+def _portfolio_output_dir():
+    override = os.environ.get(PORTFOLIO_OUTPUT_ENV, "").strip()
+    if override:
+        return bpy.path.abspath(override)
+    return os.path.join(
+        os.path.expanduser("~"),
+        "OneDrive",
+        "Documents",
+        "GitHub",
+        "portfolio",
+        "public",
+        "models",
+    )
 
 
 def resolve_output_dir(props):
+    if getattr(props, "portfolio_one_click", False):
+        return os.path.abspath(_portfolio_output_dir())
     raw_path = props.output_dir.strip() or "//web3d_output"
+    if raw_path.startswith("//") and not bpy.data.filepath:
+        raise RuntimeError(
+            "Save the .blend file before using a blend-relative output directory."
+        )
     abs_path = bpy.path.abspath(raw_path)
     if not abs_path:
         abs_path = os.path.join(os.path.expanduser("~"), "web3d_output")
-    return abs_path
+    return os.path.abspath(abs_path)
+
+
+def _output_filename(props, *, force_glb=False):
+    if getattr(props, "portfolio_one_click", False):
+        return "character.glb"
+    filename = props.base_name.strip() or "character.glb"
+    if re.search(r'[<>:"/\\|?*#%\x00-\x1F]', filename):
+        raise ValueError(
+            "The export filename contains a reserved path or URL character."
+        )
+    if filename != filename.rstrip(" ."):
+        raise ValueError("The export filename cannot end with a space or period.")
+
+    export_format = "GLB" if force_glb else getattr(props, "export_format", "GLB")
+    extension = ".glb" if export_format == "GLB" else ".gltf"
+    stem, current_extension = os.path.splitext(filename)
+    if current_extension.lower() not in {".glb", ".gltf"}:
+        stem = filename
+    stem = stem or "character"
+    if stem.upper() in WINDOWS_RESERVED:
+        raise ValueError(f"'{stem}' is a reserved filename on Windows.")
+    return stem + extension
 
 
 class TJS_OT_ExportCharacterGLB(Operator):
-    """Export animation-free character GLB model"""
+    """Export an animation-free model"""
+
     bl_idname = "tjs.export_character_glb"
-    bl_label = "Export Base Character GLB"
+    bl_label = "Export Model Only"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
         props = context.scene.tjs_props
-        output_dir = resolve_output_dir(props)
-        os.makedirs(output_dir, exist_ok=True)
-        filename = props.base_name.strip() or "character.glb"
-        if not filename.lower().endswith(".glb"):
-            filename += ".glb"
-
-        filepath = os.path.join(output_dir, filename)
         try:
-            export_character_glb(filepath, props, context)
-            msg = f"Exported character GLB to {filepath}"
-            props.status = msg
-            self.report({"INFO"}, msg)
+            output_dir = resolve_output_dir(props)
+            os.makedirs(output_dir, exist_ok=True)
+            export_format = (
+                "GLB"
+                if props.portfolio_one_click
+                else getattr(props, "export_format", "GLB")
+            )
+            filename = _output_filename(props)
+            filepath = os.path.join(output_dir, filename)
+            export_character_glb(
+                filepath,
+                props,
+                context,
+                export_format=export_format,
+                scope="SCENE" if props.portfolio_one_click else None,
+            )
+            props.status = f"Exported animation-free model to {filepath}"
+            self.report({"INFO"}, props.status)
             return {"FINISHED"}
         except Exception as exc:
-            props.status = f"Character export failed: {exc}"
+            props.status = f"Model export failed: {exc}"
             self.report({"ERROR"}, props.status)
             return {"CANCELLED"}
 
 
 class TJS_OT_ExportAnimations(Operator):
-    """Create animation-free character.glb, animations/*.anim, and animation-manifest.json"""
+    """Create character.glb, compact animations, manifest, and TS modules"""
+
     bl_idname = "tjs.export_animations"
     bl_label = "Export Character + Binary Animations"
     bl_options = {"REGISTER"}
@@ -58,91 +111,46 @@ class TJS_OT_ExportAnimations(Operator):
         props = context.scene.tjs_props
         wm = context.window_manager
         wm.progress_begin(0, 100)
-        props.status = "Loading binary animation exporter…"
+        props.status = "Preparing binary character export..."
 
         try:
-            # Delegate execution to full export runner if threejs_binary_animation_export script exists
-            addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            module_path = os.path.join(
-                os.path.dirname(addon_dir),
-                "threejs_binary_animation_export.py",
-            )
+            portfolio = getattr(props, "portfolio_one_click", False)
+            if not portfolio and getattr(props, "export_format", "GLB") != "GLB":
+                raise RuntimeError(
+                    "Character + Binary Animations requires '.glb (Binary)'. "
+                    "Use the model-only exporter for .gltf output."
+                )
 
             output_directory = resolve_output_dir(props)
             os.makedirs(output_directory, exist_ok=True)
-            filename = props.base_name.strip() or "character.glb"
-            if not filename.lower().endswith(".glb"):
-                filename += ".glb"
+            filename = _output_filename(props, force_glb=True)
 
-            if not os.path.isfile(module_path):
-                filepath = os.path.join(output_directory, filename)
-                export_character_glb(filepath, props, context)
+            def update_export_progress(value, message):
+                wm.progress_update(value)
+                props.status = message
+                if context.area:
+                    context.area.tag_redraw()
 
-                ts_filepath = os.path.join(output_directory, "model_controller.ts")
-                with open(ts_filepath, "w", encoding="utf-8") as f:
-                    f.write(typescript_module(filename, []))
-
-                props.status = f"Exported {filename} and TS helper module."
-                self.report({"INFO"}, props.status)
-                return {"FINISHED"}
-
-            spec = importlib.util.spec_from_file_location(
-                "threejs_binary_animation_export_runtime", module_path
+            result = export_character_and_animations(
+                output_directory,
+                filename,
+                props,
+                context,
+                progress_callback=update_export_progress,
+                force_all_actions=portfolio,
+                force_character_scope=portfolio,
             )
-            exporter = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(exporter)
-
-            excluded = {
-                name.strip()
-                for name in re.split(r"[,;\n]+", props.exclude_actions)
-                if name.strip()
-            }
-
-            exporter.OUTPUT_DIRECTORY = output_directory
-            exporter.GLB_FILENAME = filename
-            exporter.EXPORT_ALL_ACTIONS = props.export_all_actions
-            exporter.ACTIONS_TO_EXCLUDE = excluded
-            exporter.DECIMAL_PRECISION = props.decimal_precision
-            exporter.SAMPLING_FPS = props.sampling_fps
-            exporter.SAMPLE_BAKED_ANIMATION = props.sample_baked
-            exporter.APPLY_MODIFIERS = props.apply_modifiers
-            exporter.EXPORT_MATERIALS = props.include_materials
-            exporter.EXPORT_TEXTURES = props.include_textures
-            exporter.TEXTURE_IMAGE_FORMAT = props.image_format
-            exporter.TEXTURE_QUALITY = props.texture_quality
-            exporter.EXPORT_MORPH_TARGETS = props.include_morphs
-            exporter.EXPORT_VERTEX_COLORS = props.include_vertex_colors
-            exporter.EXPORT_TANGENTS = props.export_tangents
-            exporter.EXPORT_CUSTOM_PROPERTIES = props.custom_properties
-            exporter.MESH_COMPRESSION = props.compression
-            exporter.DRACO_COMPRESSION_LEVEL = props.draco_level
-            exporter.DRACO_POSITION_QUANTIZATION = props.draco_position
-            exporter.DRACO_NORMAL_QUANTIZATION = props.draco_normal
-            exporter.DRACO_TEXCOORD_QUANTIZATION = props.draco_texcoord
-            exporter.DRACO_COLOR_QUANTIZATION = props.draco_color
-            exporter.DRACO_GENERIC_QUANTIZATION = props.draco_generic
-            exporter.POSITION_TOLERANCE = props.position_tolerance
-            exporter.ROTATION_TOLERANCE_DEGREES = props.rotation_tolerance
-            exporter.SCALE_TOLERANCE = props.scale_tolerance
-            exporter.MORPH_TOLERANCE = props.morph_tolerance
-            exporter.ENABLE_KEYFRAME_REDUCTION = props.keyframe_reduction
-            exporter.REMOVE_STATIC_TRACKS = props.remove_static_tracks
-            exporter.ENABLE_QUANTIZATION = props.enable_animation_quantization
-            exporter.QUANTIZE_QUATERNIONS = props.quantize_quaternions
-            exporter.QUANTIZE_POSITIONS = props.quantize_vectors
-            exporter.QUANTIZE_SCALES = props.quantize_vectors
-            exporter.QUANTIZE_MORPHS = props.quantize_morphs
-
-            wm.progress_update(1)
-            props.status = "Exporting character and binary Actions…"
-            result = exporter.export_character_and_animations()
-            wm.progress_update(100)
-
             animation_count = len(result["animations"])
-            props.status = f"Done: {animation_count} animation(s), {result['tracks']} tracks"
+            if animation_count == 0:
+                raise RuntimeError("No animation clips were exported.")
+
+            props.status = (
+                f"Done: {animation_count} animation(s), "
+                f"{result['tracks']} tracks, {result['keyframes']} keys"
+            )
             self.report(
                 {"INFO"},
-                f"Exported character.glb and {animation_count} binary animation file(s).",
+                f"Exported {filename} and {animation_count} binary animation file(s).",
             )
             return {"FINISHED"}
         except Exception as exc:

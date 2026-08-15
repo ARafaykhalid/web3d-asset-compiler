@@ -26,9 +26,10 @@ Thank you for your interest in contributing to **Web3D Asset Compiler** by Abdul
    python -m unittest discover -s tests
    ```
 
-5. **Headless Blender Addon Registration Test**:
+5. **Headless Blender Addon Registration & Pipeline Smoke Tests**:
    ```bash
-   blender --background --python tests/test_blender_addon_register.py
+   blender --background --factory-startup --python tests/test_blender_addon_register.py
+   blender --background --factory-startup --python tests/test_blender_pipeline_smoke.py
    ```
 
 6. **Building the Installable Extension ZIP**:

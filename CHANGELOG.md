@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Built-in Draco mesh compression and real-time image format conversion (Auto, JPEG, WebP, None).
   - Automated TypeScript controller generator (`loadAnimatedModel()`, `AnimatedModelController`).
 - **Repository & Tooling Infrastructure**:
-  - Build script (`scripts/build_addon.py`) generating production `dist/web3d_asset_compiler.zip`.
-  - Validation script (`scripts/validate_addon.py`) verifying syntax, directory layout, and metadata.
-  - Headless Blender integration test script (`tests/test_blender_addon_register.py`).
+  - Build script (`scripts/build_extension.py`) generating production `dist/web3d_asset_compiler-1.0.0.zip`.
+  - Extension platform validation script (`scripts/validate_extension.py`) verifying manifest metadata, syntax, and directory layout.
+  - Headless Blender registration test script (`tests/test_blender_addon_register.py`) verifying all 25 registered operators and scene properties.
+  - Runtime pipeline smoke test script (`tests/test_blender_pipeline_smoke.py`) testing registration symmetry, quick baking, model export, and binary character animation export.
   - Comprehensive documentation in `docs/` and GitHub Actions CI workflow in `.github/workflows/ci.yml`.

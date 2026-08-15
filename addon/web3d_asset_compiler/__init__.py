@@ -24,8 +24,22 @@ ALL_CLASSES = BAKING_CLASSES + EXPORTER_CLASSES + PRESET_CLASSES + UI_CLASSES
 
 
 def register():
+    # Safely unregister any existing registrations to ensure idempotent registration
+    for cls in reversed(ALL_CLASSES):
+        try:
+            bpy.utils.unregister_class(cls)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+
     for cls in ALL_CLASSES:
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError:
+            try:
+                bpy.utils.unregister_class(cls)
+                bpy.utils.register_class(cls)
+            except Exception:
+                pass
 
     bpy.types.Scene.ahb_props = bpy.props.PointerProperty(type=AHB_Properties)
     bpy.types.Scene.tjs_props = bpy.props.PointerProperty(type=TJS_Properties)
@@ -36,15 +50,27 @@ def register():
 
 
 def unregister():
-    for cls in reversed(ALL_CLASSES):
-        bpy.utils.unregister_class(cls)
-
     if hasattr(bpy.types.Scene, 'ahb_props'):
-        del bpy.types.Scene.ahb_props
+        try:
+            del bpy.types.Scene.ahb_props
+        except (AttributeError, RuntimeError):
+            pass
     if hasattr(bpy.types.Scene, 'tjs_props'):
-        del bpy.types.Scene.tjs_props
+        try:
+            del bpy.types.Scene.tjs_props
+        except (AttributeError, RuntimeError):
+            pass
     if hasattr(bpy.types.Scene, 'web3d_status'):
-        del bpy.types.Scene.web3d_status
+        try:
+            del bpy.types.Scene.web3d_status
+        except (AttributeError, RuntimeError):
+            pass
+
+    for cls in reversed(ALL_CLASSES):
+        try:
+            bpy.utils.unregister_class(cls)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
 
 
 if __name__ == "__main__":

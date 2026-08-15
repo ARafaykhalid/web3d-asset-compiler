@@ -22,4 +22,11 @@ Auto HDR Baker provides automated multi-object lightmap and texture baking.
 2. Select your low-poly target object last so it becomes the Active object.
 3. Enable **Selected to Active** under the baking settings.
 4. Adjust **Cage Extrusion** and **Max Ray Distance**.
-5. Click **Bake All**.
+5. Optionally enable **Use Custom Cage** and choose a cage mesh.
+6. Click **Bake All**.
+
+## Additional Bake Targets
+
+- **Color Attributes**: Bake directly to the active corner-domain color attribute and apply it through a Color Attribute shader node.
+- **Multires Normal Bake**: Enable Multires for image-target Normal bakes when each target has a Multires modifier. Multires and Selected-to-Active are mutually exclusive.
+- **Internal Images**: Choose the internal save mode to keep baked images in the `.blend`; external mode writes them to the configured output directory.

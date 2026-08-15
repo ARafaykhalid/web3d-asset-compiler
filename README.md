@@ -44,7 +44,7 @@ Designed specifically for:
 - **Evaluated Pose Sampling**: Samples dependency-graph poses at target FPS (1–240 FPS) to accurately capture IK, constraints, and Blender-to-glTF bone conversions.
 - **Animation Quantization & Keyframe Reduction**: Tolerance-based keyframe reduction and `int16`/`uint16` quantization for minimal network payload size.
 - **Draco Mesh & Texture Compression**: Integrated Draco mesh compression and real-time image format conversion (Auto, JPEG, WebP, None).
-- **TypeScript Controller Generator**: Auto-generates type-safe TypeScript loader modules (`loadAnimatedModel()`, `AnimatedModelController`) with cross-fading, loop modes, and memory disposal (`dispose()`).
+- **TypeScript Controller Generator**: Auto-generates a binary decoder, per-animation asset modules, and a type-safe `loadAnimatedModel()` controller with lazy loading, hash validation, cross-fading, loop modes, and disposal.
 
 ---
 
@@ -75,9 +75,13 @@ Designed specifically for:
 
 1. **Select Scoped Objects**: Select the mesh objects or character rig in your scene.
 2. **Open Web3D Sidebar**: Press `N` in the 3D Viewport and click the **Web3D** tab.
-3. **Choose Preset**: Select a target preset (e.g., `⚡ React Three Fiber (R3F) Optimized`).
-4. **Click Build Web Asset**: Click **⚡ BUILD WEB ASSET (Full Pipeline)**.
+3. **Choose Preset**: Select a target preset (for example, `React Three Fiber - Balanced`).
+4. **Click Build Web Asset**: Click **Build Web Asset**. The build stops before export if baking fails.
 5. **View Output**: The extension will automatically unwrap, pack UVs, bake lightmaps, apply pre-lit shaders, compress the geometry, and write the output files into your specified output folder.
+
+Character animation exports contain `character.glb`, `animation-manifest.json`,
+`animations/*.anim`, `animationClipFactory.ts`, `model_controller.ts`, and typed
+modules under `animations/*.ts`.
 
 ---
 

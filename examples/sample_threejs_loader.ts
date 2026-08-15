@@ -1,26 +1,29 @@
-import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import type * as THREE from 'three';
+
+// Keep this module beside the generated model, manifest, and animations folder.
+import {
+  loadAnimatedModel,
+  type AnimatedModelController,
+} from './generated/model_controller.js';
 
 export async function loadWeb3DAsset(
-  modelPath: string,
-  dracoDecoderPath: string = 'https://www.gstatic.com/draco/versioned/decoders/1.5.6/',
-): Promise<{ scene: THREE.Group; mixer: THREE.AnimationMixer; clips: THREE.AnimationClip[] }> {
+  scene: THREE.Scene,
+  initialAnimation = 'Idle',
+): Promise<AnimatedModelController> {
   const dracoLoader = new DRACOLoader();
-  dracoLoader.setDecoderPath(dracoDecoderPath);
+  dracoLoader.setDecoderPath(
+    'https://www.gstatic.com/draco/versioned/decoders/1.5.7/',
+  );
 
-  const loader = new GLTFLoader();
-  loader.setDRACOLoader(dracoLoader);
-
-  const gltf = await loader.loadAsync(modelPath);
-  const scene = gltf.scene;
-  const clips = gltf.animations;
-  const mixer = new THREE.AnimationMixer(scene);
-
-  if (clips.length > 0) {
-    const action = mixer.clipAction(clips[0]);
-    action.play();
-  }
-
-  return { scene, mixer, clips };
+  const controller = await loadAnimatedModel({
+    dracoLoader,
+    preloadAnimations: [initialAnimation],
+  });
+  scene.add(controller.root);
+  await controller.play(initialAnimation);
+  return controller;
 }
+
+// Call controller.update(deltaSeconds) in the render loop and
+// controller.dispose() when the asset is removed.

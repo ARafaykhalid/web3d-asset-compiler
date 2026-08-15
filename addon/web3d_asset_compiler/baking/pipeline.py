@@ -18,6 +18,7 @@ from ..utils import (
     get_render_uv_name,
     copy_image_uv_backup,
     preserve_implicit_texture_uvs,
+    restore_image_uv_backups,
 )
 from .properties import (
     NODE_TAG,
@@ -30,6 +31,9 @@ from .properties import (
     SRGB_COLORSPACES,
     EXT_MAP,
 )
+
+BAKE_COLOR_ATTRIBUTE = "AHB_BakedColor"
+BAKE_COLOR_ATTRIBUTE_PROP = "ahb_baked_color_attribute"
 
 
 def normalize_core_names(props):
@@ -177,16 +181,21 @@ def isolate_materials_between_atlas_groups(groups):
     return duplicated
 
 
-def get_object_names(props, context):
+def get_object_names(props, context, include_empty=False):
+    def is_bake_mesh(obj):
+        return bool(
+            obj and obj.type == 'MESH'
+            and (include_empty or obj.data.polygons))
+
     if props.bake_scope == 'ACTIVE':
         obj = context.active_object
-        return [obj.name] if (obj and obj.type == 'MESH' and obj.data.polygons) else []
+        return [obj.name] if is_bake_mesh(obj) else []
     if props.bake_scope == 'SELECTED':
         return sorted([o.name for o in context.selected_objects
-                       if o.type == 'MESH' and o.data.polygons])
+                       if is_bake_mesh(o)])
     return sorted([o.name for o in context.scene.objects
-                   if o.type == 'MESH' and o.data.polygons and not o.hide_viewport
-                   and not o.hide_get(view_layer=context.view_layer)])
+            if is_bake_mesh(o) and not o.hide_viewport
+            and not o.hide_get(view_layer=context.view_layer)])
 
 
 def resolve_pipeline_targets(context, props, obj_names, report):
@@ -197,9 +206,20 @@ def resolve_pipeline_targets(context, props, obj_names, report):
     if not active or active.type != 'MESH' or not active.data.polygons:
         report({'ERROR'}, "Selected to Active needs an active mesh target.")
         return [], None
+    use_cage = getattr(props, 'use_cage', False)
+    cage_object = getattr(props, 'cage_object', None) if use_cage else None
+    if use_cage and (
+            not cage_object or cage_object.type != 'MESH'
+            or not cage_object.data.polygons):
+        report({'ERROR'}, "The custom cage must be a non-empty mesh object.")
+        return [], None
+    if cage_object is active:
+        report({'ERROR'}, "The custom cage must be separate from the active bake target.")
+        return [], None
     source_names = sorted(
         obj.name for obj in context.selected_objects
-        if obj.type == 'MESH' and obj.data.polygons and obj != active)
+        if (obj.type == 'MESH' and obj.data.polygons and obj != active
+            and obj != cage_object))
     if not source_names:
         report({'ERROR'}, "Selected to Active needs at least one other selected source mesh.")
         return [], None
@@ -237,6 +257,53 @@ def activate_bake_uv(obj_name, props):
             pass
 
 
+def ensure_bake_color_attribute(obj):
+    """Create and activate the color attribute used by vertex-color bakes."""
+    if not obj or obj.type != 'MESH':
+        return None
+    color_attributes = getattr(obj.data, 'color_attributes', None)
+    if color_attributes is None:
+        return None
+
+    attr_name = str(obj.get(
+        BAKE_COLOR_ATTRIBUTE_PROP, BAKE_COLOR_ATTRIBUTE)).strip()
+    attr_name = attr_name or BAKE_COLOR_ATTRIBUTE
+    attribute = color_attributes.get(attr_name)
+    if not attribute:
+        attribute = color_attributes.new(
+            name=attr_name, type='FLOAT_COLOR', domain='CORNER')
+
+    index = next(
+        (index for index, item in enumerate(color_attributes)
+         if item == attribute), -1)
+    if index >= 0:
+        color_attributes.active_color_index = index
+        color_attributes.render_color_index = index
+    obj[BAKE_COLOR_ATTRIBUTE_PROP] = attribute.name
+    return attribute
+
+
+def get_bake_color_attribute(obj):
+    if not obj or obj.type != 'MESH':
+        return None
+    color_attributes = getattr(obj.data, 'color_attributes', None)
+    if color_attributes is None:
+        return None
+    attr_name = obj.get(BAKE_COLOR_ATTRIBUTE_PROP, BAKE_COLOR_ATTRIBUTE)
+    return color_attributes.get(str(attr_name))
+
+
+def uses_image_bake_target(props):
+    return getattr(props, 'bake_target', 'IMAGE_TEXTURES') == 'IMAGE_TEXTURES'
+
+
+def bake_type_needs_uv(props):
+    return (uses_image_bake_target(props)
+            or props.bake_type == 'UV'
+            or (props.bake_type == 'NORMAL'
+                and getattr(props, 'normal_space', 'TANGENT') == 'TANGENT'))
+
+
 def pixel_margin_to_uv(px, props):
     rx, ry = get_resolution(props)
     return px / min(rx, ry)
@@ -271,6 +338,239 @@ def enter_edit_select_all(obj, layer_name):
     bpy.ops.mesh.select_all(action='SELECT')
     if layer_name in obj.data.uv_layers:
         obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
+
+
+def subdivide_large_uv_islands(obj_name, layer_name, max_island_ratio=0.15):
+    """Mark seams through large or sparse UV islands before re-unwrapping."""
+    obj = bpy.data.objects.get(obj_name)
+    if not obj or obj.type != 'MESH' or layer_name not in obj.data.uv_layers:
+        return False
+
+    mesh = obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        uv_layer = bm.loops.layers.uv.get(layer_name)
+        if not uv_layer:
+            return False
+
+        face_island = {}
+        island_faces = {}
+        visited = set()
+        island_id = 0
+        for face in bm.faces:
+            if face.index in visited:
+                continue
+            stack = [face]
+            faces = []
+            while stack:
+                current = stack.pop()
+                if current.index in visited:
+                    continue
+                visited.add(current.index)
+                face_island[current.index] = island_id
+                faces.append(current)
+                for edge in current.edges:
+                    if edge.seam:
+                        continue
+                    for linked_face in edge.link_faces:
+                        if linked_face.index not in visited:
+                            stack.append(linked_face)
+            island_faces[island_id] = faces
+            island_id += 1
+
+        large_islands = []
+        for island_id, faces in island_faces.items():
+            min_x = min_y = float('inf')
+            max_x = max_y = float('-inf')
+            actual_area = 0.0
+            for face in faces:
+                points = [loop[uv_layer].uv for loop in face.loops]
+                for uv in points:
+                    min_x = min(min_x, uv.x)
+                    min_y = min(min_y, uv.y)
+                    max_x = max(max_x, uv.x)
+                    max_y = max(max_y, uv.y)
+                signed_area = 0.0
+                for index, point in enumerate(points):
+                    next_point = points[(index + 1) % len(points)]
+                    signed_area += point.x * next_point.y - next_point.x * point.y
+                actual_area += abs(signed_area) * 0.5
+
+            bounds_area = (max_x - min_x) * (max_y - min_y)
+            fill_ratio = actual_area / max(bounds_area, 1e-12)
+            if (bounds_area > max_island_ratio
+                    or (bounds_area > 0.02 and fill_ratio < 0.6)):
+                large_islands.append(island_id)
+
+        marked_any = False
+        for island_id in large_islands:
+            faces = island_faces[island_id]
+            face_indices = {face.index for face in faces}
+            if len(face_indices) < 4:
+                continue
+
+            interior_edges = {
+                edge for face in faces for edge in face.edges
+                if not edge.seam
+                and sum(linked.index in face_indices
+                        for linked in edge.link_faces) == 2
+            }
+            if not interior_edges:
+                continue
+
+            ordered_edges = sorted(
+                interior_edges, key=lambda edge: edge.calc_length(), reverse=True)
+            for edge in ordered_edges[:max(1, len(ordered_edges) // 3)]:
+                edge.seam = True
+                marked_any = True
+
+        if marked_any:
+            bm.to_mesh(mesh)
+            mesh.update()
+        return marked_any
+    finally:
+        bm.free()
+
+
+def stack_similar_islands(obj_names, layer_name, area_tol=0.01, perim_tol=0.01):
+    """Stack translation-identical islands while rejecting unsafe lookalikes."""
+    stacked_total = 0
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if not obj or obj.type != 'MESH' or layer_name not in obj.data.uv_layers:
+            continue
+
+        mesh = obj.data
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.get(layer_name)
+            if not uv_layer:
+                continue
+
+            islands = []
+            visited = set()
+            for face in bm.faces:
+                if face.index in visited:
+                    continue
+                stack = [face]
+                faces = []
+                while stack:
+                    current = stack.pop()
+                    if current.index in visited:
+                        continue
+                    visited.add(current.index)
+                    faces.append(current)
+                    for edge in current.edges:
+                        if edge.seam:
+                            continue
+                        for linked_face in edge.link_faces:
+                            if linked_face.index not in visited:
+                                stack.append(linked_face)
+                islands.append(faces)
+
+            groups = []
+            for faces in islands:
+                loops = [loop for face in faces for loop in face.loops]
+                if not loops:
+                    continue
+                center = Vector((0.0, 0.0))
+                for loop in loops:
+                    center += loop[uv_layer].uv
+                center /= len(loops)
+
+                uv_shape = tuple(sorted(
+                    (round(loop[uv_layer].uv.x - center.x, 6),
+                     round(loop[uv_layer].uv.y - center.y, 6))
+                    for loop in loops
+                ))
+                data = {
+                    'area': sum(face.calc_area() for face in faces),
+                    'perimeter': sum(face.calc_perimeter() for face in faces),
+                    'center': center,
+                    'faces': faces,
+                    'signature': (
+                        tuple(sorted(len(face.loops) for face in faces)),
+                        tuple(sorted(face.material_index for face in faces)),
+                        uv_shape,
+                    ),
+                }
+
+                placed = False
+                for group in groups:
+                    master = group[0]
+                    area_limit = area_tol * max(abs(master['area']), 1e-12)
+                    perim_limit = perim_tol * max(abs(master['perimeter']), 1e-12)
+                    if (data['signature'] == master['signature']
+                            and abs(data['area'] - master['area']) <= area_limit
+                            and abs(data['perimeter'] - master['perimeter']) <= perim_limit):
+                        group.append(data)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([data])
+
+            for group in groups:
+                master = group[0]
+                for target in group[1:]:
+                    offset = master['center'] - target['center']
+                    for face in target['faces']:
+                        for loop in face.loops:
+                            loop[uv_layer].uv += offset
+                    stacked_total += 1
+
+            if any(len(group) > 1 for group in groups):
+                bm.to_mesh(mesh)
+                mesh.update()
+        finally:
+            bm.free()
+
+    return stacked_total
+
+
+def scale_uvs_to_bounds(obj_names, layer_name, margin=0.005):
+    """Uniformly scale packed UVs to the available zero-to-one bounds."""
+    min_x = min_y = float('inf')
+    max_x = max_y = float('-inf')
+    has_uvs = False
+
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if not obj or obj.type != 'MESH' or layer_name not in obj.data.uv_layers:
+            continue
+        uv_layer = obj.data.uv_layers[layer_name]
+        for loop in uv_layer.data:
+            min_x = min(min_x, loop.uv.x)
+            min_y = min(min_y, loop.uv.y)
+            max_x = max(max_x, loop.uv.x)
+            max_y = max(max_y, loop.uv.y)
+            has_uvs = True
+
+    width = max_x - min_x
+    height = max_y - min_y
+    if not has_uvs or width < 1e-6 or height < 1e-6:
+        return False
+
+    margin = max(0.0, min(float(margin), 0.49))
+    target = 1.0 - 2.0 * margin
+    scale = min(target / width, target / height)
+    center_x = (min_x + max_x) * 0.5
+    center_y = (min_y + max_y) * 0.5
+
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if not obj or obj.type != 'MESH' or layer_name not in obj.data.uv_layers:
+            continue
+        uv_layer = obj.data.uv_layers[layer_name]
+        for loop in uv_layer.data:
+            loop.uv.x = (loop.uv.x - center_x) * scale + 0.5
+            loop.uv.y = (loop.uv.y - center_y) * scale + 0.5
+        obj.data.update()
+    return True
 
 
 def world_surface_area(obj):
@@ -388,9 +688,14 @@ def apply_image_boost(obj_name, props):
 
 def run_blender_pack(props, uv_margin):
     rotate = props.pack_rotate and props.pack_rotation_step != 'NONE'
-    rot_method = 'ANY' if props.pack_rotation_step == 'ANY' else 'AXIS_ALIGNED'
-    shape_method = 'CONVEX' if props.pack_shape_method == 'CONCAVE' else props.pack_shape_method
+    rotation_mode = props.pack_rotation_step
+    if rotation_mode in ('90', '45'):
+        rotation_mode = 'AXIS_ALIGNED'
+    rot_method = ('ANY' if rotation_mode == 'ANY' else 'AXIS_ALIGNED')
+    shape_method = ('CONCAVE' if props.pack_nest_holes
+                    else props.pack_shape_method)
     scale = True
+    merge_overlap = props.pack_stack_identical
 
     try:
         bpy.ops.uv.pack_islands(
@@ -400,7 +705,7 @@ def run_blender_pack(props, uv_margin):
             rotate_method=rot_method,
             scale=scale,
             shape_method=shape_method,
-            merge_overlap=False
+            merge_overlap=merge_overlap,
         )
         return
     except Exception:
@@ -412,7 +717,7 @@ def run_blender_pack(props, uv_margin):
             rotate=rotate,
             scale=scale,
             shape_method=shape_method,
-            merge_overlap=False
+            merge_overlap=merge_overlap,
         )
         return
     except Exception:
@@ -453,6 +758,9 @@ def run_uv_pack(obj_name, props):
     uv_margin = pixel_margin_to_uv(props.pack_margin_px, props)
     rotate = props.pack_rotate and props.pack_rotation_step != 'NONE'
 
+    if props.pack_engine == 'BLENDER' and props.pack_stack_identical:
+        stack_similar_islands([obj_name], layer_name)
+
     enter_edit_select_all(obj, layer_name)
     try:
         if props.pack_engine == 'UVP3' and hasattr(bpy.ops, 'uvpackmaster3'):
@@ -473,15 +781,6 @@ def run_uv_pack(obj_name, props):
         for _i in range(props.pack_iterations):
             run_blender_pack(props, uv_margin)
 
-        if rotate and props.pack_rotation_step in ('90', '45'):
-            try:
-                bpy.ops.uv.pack_islands(
-                    margin=uv_margin,
-                    rotate=True,
-                    rotate_method='AXIS_ALIGNED' if props.pack_rotation_step == '90' else 'ANY',
-                )
-            except (TypeError, RuntimeError):
-                pass
     finally:
         force_object_mode()
 
@@ -492,6 +791,10 @@ def pack_uv_islands_phased(obj_name, props):
     if props.pack_image_boost > 1.01:
         apply_image_boost(obj_name, props)
     run_uv_pack(obj_name, props)
+    if props.pack_scale_islands:
+        scale_uvs_to_bounds(
+            [obj_name], props.uv_layer_name,
+            margin=pixel_margin_to_uv(props.pack_margin_px, props))
 
 
 def remove_old_uvs(obj_names, keep_layer_name):
@@ -539,6 +842,11 @@ def ensure_uv(obj_name, props):
             pack_uv_islands_phased(obj_name, props)
         return
 
+    if (props.uv_mode == 'AUTO_SEAM'
+            and getattr(props, 'renew_auto_seams_on_preview', False)):
+        for edge in mesh.edges:
+            edge.use_seam = False
+
     force_object_mode()
     bpy.context.view_layer.objects.active = obj
     try:
@@ -581,6 +889,16 @@ def ensure_uv(obj_name, props):
     finally:
         force_object_mode()
 
+    if (props.uv_mode == 'AUTO_SEAM'
+            and subdivide_large_uv_islands(obj_name, layer_name)):
+        obj = bpy.data.objects.get(obj_name)
+        if obj:
+            enter_edit_select_all(obj, layer_name)
+            try:
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+            finally:
+                force_object_mode()
+
     if props.pack_enabled:
         pack_uv_islands_phased(obj_name, props)
 
@@ -603,6 +921,10 @@ def setup_atlas_uvs(obj_names, props):
         if layer_name not in mesh.uv_layers:
             mesh.uv_layers.new(name=layer_name)
         mesh.uv_layers.active = mesh.uv_layers[layer_name]
+        if (props.uv_mode == 'AUTO_SEAM'
+                and getattr(props, 'renew_auto_seams_on_preview', False)):
+            for edge in mesh.edges:
+                edge.use_seam = False
         valid_objs.append(obj_name)
 
     if not valid_objs:
@@ -670,6 +992,34 @@ def setup_atlas_uvs(obj_names, props):
     finally:
         force_object_mode()
 
+    if props.uv_mode == 'AUTO_SEAM':
+        any_split = False
+        for obj_name in valid_objs:
+            if subdivide_large_uv_islands(obj_name, layer_name):
+                any_split = True
+        if any_split:
+            force_object_mode()
+            bpy.ops.object.select_all(action='DESELECT')
+            first_obj = None
+            for obj_name in valid_objs:
+                obj = bpy.data.objects.get(obj_name)
+                if obj:
+                    obj.select_set(True)
+                    if first_obj is None:
+                        first_obj = obj
+            if first_obj:
+                bpy.context.view_layer.objects.active = first_obj
+                try:
+                    bpy.ops.object.mode_set(mode='EDIT')
+                    bpy.ops.mesh.select_all(action='SELECT')
+                    for obj_name in valid_objs:
+                        obj = bpy.data.objects.get(obj_name)
+                        if obj and layer_name in obj.data.uv_layers:
+                            obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
+                    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+                finally:
+                    force_object_mode()
+
     if props.pack_enabled:
         atlas_pack_phase(valid_objs, props)
 
@@ -707,6 +1057,9 @@ def atlas_pack_phase(obj_names, props):
         for obj_name in obj_names:
             apply_world_area_scale(obj_name, layer_name)
 
+    if props.pack_engine == 'BLENDER' and props.pack_stack_identical:
+        stack_similar_islands(obj_names, layer_name)
+
     force_object_mode()
     bpy.ops.object.select_all(action='DESELECT')
     first_obj = None
@@ -719,6 +1072,7 @@ def atlas_pack_phase(obj_names, props):
     if first_obj:
         bpy.context.view_layer.objects.active = first_obj
         uv_margin = pixel_margin_to_uv(props.pack_margin_px, props)
+        packed = False
         try:
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_all(action='SELECT')
@@ -731,21 +1085,26 @@ def atlas_pack_phase(obj_names, props):
                 try:
                     bpy.context.scene.uvp3_props.margin = uv_margin
                     bpy.ops.uvpackmaster3.pack()
-                    return
+                    packed = True
                 except Exception:
                     pass
-            elif props.pack_engine == 'UVP2' and hasattr(bpy.ops, 'uvpackmaster2'):
+            if (not packed and props.pack_engine == 'UVP2'
+                    and hasattr(bpy.ops, 'uvpackmaster2')):
                 try:
                     bpy.context.scene.uvp2_props.margin = uv_margin
                     bpy.ops.uvpackmaster2.uv_pack()
-                    return
+                    packed = True
                 except Exception:
                     pass
 
-            for _i in range(props.pack_iterations):
-                run_blender_pack(props, uv_margin)
+            if not packed:
+                for _i in range(props.pack_iterations):
+                    run_blender_pack(props, uv_margin)
         finally:
             force_object_mode()
+
+        if props.pack_scale_islands:
+            scale_uvs_to_bounds(obj_names, layer_name, margin=uv_margin)
 
 
 def distribute_tiles(obj_names, tile_count):
@@ -941,8 +1300,27 @@ def configure_bake_settings(props, context):
     scene.cycles.samples = props.samples
     configure_cycles_device(scene, props)
 
+    try:
+        scene.cycles.bake_type = props.bake_type
+    except (AttributeError, TypeError, ValueError):
+        pass
+
     bake = scene.render.bake
     bake.use_clear = props.clear_bake
+    bake.target = getattr(props, 'bake_target', 'IMAGE_TEXTURES')
+
+    use_multires = getattr(props, 'multires_bake', False)
+    if use_multires:
+        if not uses_image_bake_target(props):
+            raise RuntimeError("Multires baking requires Image Textures output")
+        if props.use_selected_to_active:
+            raise RuntimeError("Multires baking cannot use Selected to Active")
+        if props.bake_type != 'NORMAL':
+            raise RuntimeError(
+                "This add-on supports Multires only for Normal bakes")
+    bake.use_multires = use_multires
+    if use_multires:
+        bake.type = 'NORMALS'
 
     if props.pack_enabled:
         bake.margin = min(props.margin, max(0, props.pack_margin_px // 2))
@@ -958,14 +1336,38 @@ def configure_bake_settings(props, context):
     bake.use_pass_indirect = props.use_pass_indirect
     bake.use_pass_color    = props.use_pass_color
 
-    bake.use_selected_to_active = props.use_selected_to_active
-    if props.use_selected_to_active:
+    if props.bake_type == 'NORMAL':
+        bake.normal_space = getattr(props, 'normal_space', 'TANGENT')
+        bake.normal_r = getattr(props, 'normal_r', 'POS_X')
+        bake.normal_g = getattr(props, 'normal_g', 'POS_Y')
+        bake.normal_b = getattr(props, 'normal_b', 'POS_Z')
+
+    bake.use_selected_to_active = (
+        props.use_selected_to_active and not use_multires)
+    bake.use_cage = False
+    try:
+        bake.cage_object = ""
+    except (AttributeError, TypeError):
+        pass
+    if bake.use_selected_to_active:
         bake.cage_extrusion   = props.cage_extrusion
         bake.max_ray_distance = props.max_ray_distance
+        if getattr(props, 'use_cage', False):
+            cage_object = getattr(props, 'cage_object', None)
+            if not cage_object or cage_object.type != 'MESH':
+                raise RuntimeError("Choose a valid mesh object as the custom cage")
+            bake.use_cage = True
+            bake.cage_object = cage_object.name
 
 
 def save_image(image, props, context):
-    out_dir = bpy.path.abspath(props.output_dir)
+    raw_output_dir = str(getattr(props, 'output_dir', '')).strip() or '//baked/'
+    if raw_output_dir.startswith('//') and not bpy.data.filepath:
+        raise RuntimeError(
+            "The blend file must be saved before using a blend-relative bake output path"
+        )
+
+    out_dir = bpy.path.abspath(raw_output_dir)
     os.makedirs(out_dir, exist_ok=True)
 
     ext  = EXT_MAP.get(props.image_format, '.exr')
@@ -975,25 +1377,39 @@ def save_image(image, props, context):
     img_settings = scene.render.image_settings
     save_format = ('OPEN_EXR' if props.image_format == 'OPEN_EXR_MULTILAYER'
                    else props.image_format)
-    img_settings.file_format = save_format
-    img_settings.color_mode = ('RGB' if save_format in ('JPEG', 'HDR')
-                               else props.color_mode)
-
-    if save_format == 'OPEN_EXR':
-        img_settings.color_depth = '32' if props.use_hdr_float else '16'
-        img_settings.exr_codec   = props.exr_codec
-    elif save_format == 'JPEG':
+    original_settings = {}
+    for setting_name in (
+            'file_format', 'color_mode', 'color_depth', 'exr_codec', 'quality'):
         try:
-            img_settings.quality = 100
+            original_settings[setting_name] = getattr(img_settings, setting_name)
         except (AttributeError, TypeError):
-            pass
-
+            continue
     try:
-        image.filepath_raw = path
-        image.file_format = save_format
-        image.save()
-    except TypeError:
-        image.save(filepath=path)
+        img_settings.file_format = save_format
+        img_settings.color_mode = ('RGB' if save_format in ('JPEG', 'HDR')
+                                   else props.color_mode)
+
+        if save_format == 'OPEN_EXR':
+            img_settings.color_depth = '32' if props.use_hdr_float else '16'
+            img_settings.exr_codec = props.exr_codec
+        elif save_format == 'JPEG':
+            try:
+                img_settings.quality = 100
+            except (AttributeError, TypeError):
+                pass
+
+        try:
+            image.filepath_raw = path
+            image.file_format = save_format
+            image.save()
+        except TypeError:
+            image.save(filepath=path)
+    finally:
+        for setting_name, value in original_settings.items():
+            try:
+                setattr(img_settings, setting_name, value)
+            except (AttributeError, TypeError):
+                pass
 
     return path
 
@@ -1010,7 +1426,10 @@ def do_bake_batch(obj_names, props, context, source_obj_names=None):
 
     if not validate_bake_ready([obj.name for obj in objs_to_bake], props,
                                 lambda _level, _message: None):
-        raise RuntimeError("Bake target is missing a UV layer or active image node")
+        target_label = ("UV layer or active image node"
+                        if uses_image_bake_target(props)
+                        else "active color attribute")
+        raise RuntimeError(f"Bake target is missing its required {target_label}")
 
     source_objs = []
     if props.use_selected_to_active:
@@ -1032,19 +1451,23 @@ def do_bake_batch(obj_names, props, context, source_obj_names=None):
             context.view_layer.objects.active = obj
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        activate_bake_uv(obj.name, props)
+        if bake_type_needs_uv(props):
+            activate_bake_uv(obj.name, props)
 
-        for slot in obj.material_slots:
-            mat = slot.material
-            if mat and mat.use_nodes:
-                tag = bake_node_tag(props.image_node_name)
-                for node in mat.node_tree.nodes:
-                    if node.name.startswith(tag):
-                        for existing in mat.node_tree.nodes:
-                            existing.select = False
-                        node.select = True
-                        mat.node_tree.nodes.active = node
-                        break
+        if uses_image_bake_target(props):
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat and mat.use_nodes:
+                    tag = bake_node_tag(props.image_node_name)
+                    for node in mat.node_tree.nodes:
+                        if node.name.startswith(tag):
+                            for existing in mat.node_tree.nodes:
+                                existing.select = False
+                            node.select = True
+                            mat.node_tree.nodes.active = node
+                            break
+        else:
+            ensure_bake_color_attribute(obj)
 
     active_obj = objs_to_bake[0]
     context.view_layer.objects.active = active_obj
@@ -1053,18 +1476,26 @@ def do_bake_batch(obj_names, props, context, source_obj_names=None):
 
     selected_for_bake = source_objs + objs_to_bake
 
+    def execute_bake():
+        if getattr(props, 'multires_bake', False):
+            return bpy.ops.object.bake_image()
+        return bpy.ops.object.bake(type=props.bake_type)
+
     try:
         with bpy.context.temp_override(
             active_object=active_obj,
             selected_objects=selected_for_bake,
             selected_editable_objects=selected_for_bake,
         ):
-            bpy.ops.object.bake(type=props.bake_type)
+            result = execute_bake()
     except RuntimeError as e:
         try:
-            bpy.ops.object.bake(type=props.bake_type)
+            result = execute_bake()
         except Exception:
             raise e
+
+    if not result or 'FINISHED' not in result:
+        raise RuntimeError("Blender cancelled the bake operation")
 
     return True
 
@@ -1072,13 +1503,22 @@ def do_bake_batch(obj_names, props, context, source_obj_names=None):
 def validate_bake_ready(obj_names, props, report):
     failures = []
     tag = bake_node_tag(props.image_node_name)
+    image_target = uses_image_bake_target(props)
     for obj_name in obj_names:
         obj = bpy.data.objects.get(obj_name)
         if not obj or obj.type != 'MESH' or not obj.data.polygons:
             failures.append(f"{obj_name}: no bakeable mesh faces")
             continue
-        if props.uv_layer_name not in obj.data.uv_layers:
+        if (bake_type_needs_uv(props)
+                and props.uv_layer_name not in obj.data.uv_layers):
             failures.append(f"{obj_name}: missing UV layer '{props.uv_layer_name}'")
+            continue
+        if not image_target and not get_bake_color_attribute(obj):
+            failures.append(f"{obj_name}: missing active bake color attribute")
+            continue
+        if getattr(props, 'multires_bake', False) and not any(
+                modifier.type == 'MULTIRES' for modifier in obj.modifiers):
+            failures.append(f"{obj_name}: no Multires modifier")
             continue
         for slot_index in {poly.material_index for poly in obj.data.polygons}:
             if slot_index >= len(obj.material_slots):
@@ -1088,11 +1528,12 @@ def validate_bake_ready(obj_names, props, report):
             if not mat or not mat.use_nodes:
                 failures.append(f"{obj_name}: empty material slot {slot_index + 1}")
                 continue
-            node = next((n for n in mat.node_tree.nodes
-                         if n.name.startswith(tag) and n.type == 'TEX_IMAGE'
-                         and n.image), None)
-            if not node:
-                failures.append(f"{obj_name}: no bake target in '{mat.name}'")
+            if image_target:
+                node = next((n for n in mat.node_tree.nodes
+                             if n.name.startswith(tag) and n.type == 'TEX_IMAGE'
+                             and n.image), None)
+                if not node:
+                    failures.append(f"{obj_name}: no bake target in '{mat.name}'")
 
     if failures:
         preview = "; ".join(failures[:4])
@@ -1123,7 +1564,8 @@ def get_object_bake_image(obj, props, material=None):
         groups = get_atlas_groups([obj.name], props)
         for atlas_number, names in groups:
             if obj.name in names:
-                return get_collection_atlas_image(props, atlas_number)
+                atlas_name = get_collection_atlas_name(props, atlas_number)
+                return bpy.data.images.get(f"{props.output_prefix}{atlas_name}")
 
     tag = bake_node_tag(props.image_node_name)
     if obj.material_slots:
@@ -1143,20 +1585,26 @@ def get_object_bake_image(obj, props, material=None):
 def apply_single_object_bake(obj, props, mode, report):
     applied = 0
     processed = set()
+    color_attribute = (get_bake_color_attribute(obj)
+                       if not uses_image_bake_target(props) else None)
     for slot in obj.material_slots:
         mat = slot.material
         if not mat or mat.name in processed:
             continue
         processed.add(mat.name)
+        if color_attribute:
+            ensure_material_backup(mat)
+            if apply_baked_color_to_material(
+                    mat.name, color_attribute.name, mode,
+                    props.apply_keep_original_nodes):
+                applied += 1
+            continue
         image = get_object_bake_image(
             obj, props, mat if props.image_mode == 'PER_MATERIAL' else None)
         if not image:
             report({'WARNING'}, f"No existing bake image found for '{mat.name}'.")
             continue
-        backup_name = f"{mat.name}_AHB_backup"
-        if not bpy.data.materials.get(backup_name):
-            backup = mat.copy()
-            backup.name = backup_name
+        ensure_material_backup(mat)
         if apply_baked_to_material(
                 mat.name, image, mode, props.apply_keep_original_nodes,
                 props.uv_layer_name):
@@ -1231,6 +1679,12 @@ def clear_and_renew_auto_seams(obj_names, props):
 
 
 def rename_objects_by_texture(obj_names, props, report):
+    if not uses_image_bake_target(props):
+        report(
+            {'WARNING'},
+            "Object renaming by texture is unavailable for color attribute bakes.")
+        return 0
+
     image_mode = props.image_mode
     renamed = 0
 
@@ -1332,7 +1786,9 @@ def group_objects_by_tile(obj_names, props, report):
 
 def run_setup(obj_names, props, report):
     normalize_core_names(props)
-    prepare_mesh_data(obj_names, make_unique=props.auto_create_uv)
+    image_target = uses_image_bake_target(props)
+    prepare_mesh_data(
+        obj_names, make_unique=(props.auto_create_uv or not image_target))
     created_materials = prepare_material_slots(obj_names)
     if created_materials:
         report({'INFO'}, f"Created {created_materials} missing bake material(s).")
@@ -1349,6 +1805,31 @@ def run_setup(obj_names, props, report):
                     slot.material = slot.material.copy()
 
     preserve_implicit_texture_uvs(obj_names, props)
+
+    if not image_target:
+        mat_map = collect_material_names(obj_names)
+        if not mat_map:
+            report({'WARNING'}, "No materials found on objects.")
+            return False
+
+        for obj_name in obj_names:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj or obj.type != 'MESH':
+                continue
+            if (bake_type_needs_uv(props) and props.auto_create_uv
+                    and props.uv_layer_name not in obj.data.uv_layers):
+                ensure_uv(obj_name, props)
+            if not ensure_bake_color_attribute(obj):
+                report({'ERROR'}, f"Cannot create a bake color attribute on {obj_name}")
+                return False
+
+        if not validate_bake_ready(obj_names, props, report):
+            return False
+        msg = (f"Setup done: color attributes ready on "
+               f"{len(obj_names)} object(s)")
+        props.status_text = msg
+        report({'INFO'}, msg)
+        return True
 
     image_mode = props.image_mode
     props.status_text = f"Setting up {image_mode} mode…"
@@ -1367,6 +1848,7 @@ def run_setup(obj_names, props, report):
         return False
 
     if image_mode == 'ATLAS':
+        remove_tile_uv_offsets(obj_names, props.uv_layer_name)
         if props.auto_create_uv:
             try:
                 setup_atlas_uvs(obj_names, props)
@@ -1380,6 +1862,7 @@ def run_setup(obj_names, props, report):
             inject_bake_node(mat_name, shared_img, props.image_node_name)
 
     elif image_mode == 'AUTO_TILES':
+        remove_tile_uv_offsets(obj_names, props.uv_layer_name)
         tiles = distribute_tiles(obj_names, props.tile_count)
         for tile_idx, tile_obj_names in enumerate(tiles):
             props.status_text = f"Setting up tile {tile_idx + 1}/{len(tiles)}…"
@@ -1406,6 +1889,7 @@ def run_setup(obj_names, props, report):
         for atlas_number, atlas_obj_names in collection_groups:
             if not atlas_obj_names:
                 continue
+            remove_tile_uv_offsets(atlas_obj_names, props.uv_layer_name)
             if props.auto_create_uv:
                 try:
                     setup_atlas_uvs(atlas_obj_names, props)
@@ -1464,7 +1948,23 @@ def run_bake(obj_names, props, context, report, source_obj_names=None):
     errors = 0
     total = len(obj_names)
 
-    if image_mode == 'AUTO_TILES':
+    if not uses_image_bake_target(props):
+        props.status_text = f"Baking color attributes on {len(obj_names)} object(s)"
+        force_ui_redraw()
+        try:
+            if do_bake_batch(obj_names, props, context, source_obj_names):
+                baked_names.update(obj_names)
+                for obj_name in obj_names:
+                    obj = bpy.data.objects.get(obj_name)
+                    attribute = get_bake_color_attribute(obj)
+                    if obj and attribute:
+                        obj[BAKE_COLOR_ATTRIBUTE_PROP] = attribute.name
+                report({'INFO'}, f"Baked color attributes on {len(obj_names)} object(s)")
+        except Exception as e:
+            errors += 1
+            report({'ERROR'}, f"Color attribute bake FAILED: {e}")
+
+    elif image_mode == 'AUTO_TILES':
         tiles = distribute_tiles(obj_names, props.tile_count)
         for tile_idx, tile_obj_names in enumerate(tiles):
             tile_img = get_tile_image(props, tile_idx)
@@ -1598,6 +2098,8 @@ def run_bake(obj_names, props, context, report, source_obj_names=None):
                 continue
             if len(image_names) == 1:
                 obj["ahb_baked_texture"] = next(iter(image_names))
+            elif "ahb_baked_texture" in obj:
+                del obj["ahb_baked_texture"]
 
         if valid_objs:
             valid_objs = sorted(valid_objs)
@@ -1615,7 +2117,8 @@ def run_bake(obj_names, props, context, report, source_obj_names=None):
                 errors += 1
                 report({'ERROR'}, f"Per-material bake FAILED: {e}")
 
-    if props.auto_save:
+    if (uses_image_bake_target(props) and props.auto_save
+            and getattr(props, 'save_mode', 'EXTERNAL') == 'EXTERNAL'):
         props.status_text = "Saving images…"
         force_ui_redraw()
         saved = 0
@@ -1625,6 +2128,7 @@ def run_bake(obj_names, props, context, report, source_obj_names=None):
                     path = save_image(img, props, context)
                     saved += 1
                 except Exception as e:
+                    errors += 1
                     report({'WARNING'}, f"Save failed [{img.name}]: {e}")
 
     if props.auto_cleanup_nodes and baked_names and all_mat_names:
@@ -1652,7 +2156,10 @@ def apply_baked_to_material(mat_name, baked_img, mode, keep_original, uv_layer_n
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
-    generated_names = {'AHB_UV_Map', 'AHB_Applied_Texture', 'AHB_Emission', 'AHB_Principled'}
+    generated_names = {
+        'AHB_UV_Map', 'AHB_Applied_Texture', 'AHB_Applied_Color',
+        'AHB_Emission', 'AHB_Principled',
+    }
     for node in list(nodes):
         if node.name in generated_names:
             nodes.remove(node)
@@ -1753,51 +2260,252 @@ def apply_baked_to_material(mat_name, baked_img, mode, keep_original, uv_layer_n
     return True
 
 
+def apply_baked_color_to_material(
+        mat_name, attribute_name, mode, keep_original):
+    """Wire a baked mesh color attribute into a material shader graph."""
+    mat = bpy.data.materials.get(mat_name)
+    if not mat or not mat.use_nodes:
+        return False
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    generated_names = {
+        'AHB_UV_Map', 'AHB_Applied_Texture', 'AHB_Applied_Color',
+        'AHB_Emission', 'AHB_Principled',
+    }
+    for node in list(nodes):
+        if node.name in generated_names:
+            nodes.remove(node)
+
+    if keep_original:
+        output_node = next((
+            node for node in nodes
+            if node.type == 'OUTPUT_MATERIAL' and node.is_active_output), None)
+        if not output_node:
+            output_node = next((
+                node for node in nodes if node.type == 'OUTPUT_MATERIAL'), None)
+        for node in nodes:
+            if node.type != 'OUTPUT_MATERIAL':
+                node.mute = True
+        if output_node:
+            for link in list(links):
+                if (link.to_node == output_node
+                        and link.to_socket.name == 'Surface'):
+                    links.remove(link)
+        else:
+            output_node = nodes.new('ShaderNodeOutputMaterial')
+            output_node.name = 'Material Output'
+            output_node.location = (300, 0)
+        source_x = output_node.location.x - 700
+        shader_x = output_node.location.x - 350
+        source_y = output_node.location.y
+    else:
+        nodes.clear()
+        output_node = nodes.new('ShaderNodeOutputMaterial')
+        output_node.name = 'Material Output'
+        output_node.location = (300, 0)
+        source_x = -400
+        shader_x = -50
+        source_y = 0
+
+    color_node = nodes.new('ShaderNodeVertexColor')
+    color_node.name = 'AHB_Applied_Color'
+    color_node.label = 'Baked Color Attribute'
+    color_node.layer_name = attribute_name
+    color_node.location = (source_x, source_y)
+
+    if mode == 'EMISSION':
+        shader = nodes.new('ShaderNodeEmission')
+        shader.name = 'AHB_Emission'
+        shader.label = 'Baked Emission'
+        shader.inputs['Strength'].default_value = 1.0
+        shader.location = (shader_x, source_y)
+        links.new(color_node.outputs['Color'], shader.inputs['Color'])
+        links.new(shader.outputs['Emission'], output_node.inputs['Surface'])
+    else:
+        shader = nodes.new('ShaderNodeBsdfPrincipled')
+        shader.name = 'AHB_Principled'
+        shader.location = (shader_x, source_y)
+        links.new(color_node.outputs['Color'], shader.inputs['Base Color'])
+        links.new(shader.outputs['BSDF'], output_node.inputs['Surface'])
+    return True
+
+
+def ensure_material_backup(mat):
+    backup_name = f"{mat.name}_AHB_backup"
+    backup = bpy.data.materials.get(backup_name)
+    if not backup:
+        backup = mat.copy()
+        backup.name = backup_name
+    return backup
+
+
+def get_existing_tile_groups(obj_names, props):
+    """Group objects by recorded tile image before using distribution fallback."""
+    groups = {}
+    fallback = []
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        image = get_object_bake_image(obj, props)
+        if image and image.name.startswith(f"{props.output_prefix}tile_"):
+            match = re.search(r'tile_(\d+)', image.name, re.IGNORECASE)
+            if match:
+                tile_idx = int(match.group(1)) - 1
+                groups.setdefault(tile_idx, []).append(obj_name)
+                continue
+        fallback.append(obj_name)
+
+    if fallback:
+        predicted = distribute_tiles(fallback, props.tile_count)
+        used = set(groups)
+        next_idx = 0
+        for tile_objs in predicted:
+            while next_idx in used:
+                next_idx += 1
+            groups.setdefault(next_idx, []).extend(tile_objs)
+            used.add(next_idx)
+            next_idx += 1
+    return [(idx, groups[idx]) for idx in sorted(groups)]
+
+
+def apply_grouped_bake_images(groups, props, mode):
+    """Apply one image per object group, isolating cross-group materials."""
+    applied = 0
+    skipped = 0
+    first_group_by_material = {}
+    variant_by_material_group = {}
+
+    for group_key, suffix, object_names, image in groups:
+        if not image:
+            skipped += sum(
+                len(obj.material_slots) for name in object_names
+                if (obj := bpy.data.objects.get(name)))
+            continue
+
+        done_in_group = set()
+        for obj_name in object_names:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj:
+                continue
+            for slot in obj.material_slots:
+                material = slot.material
+                if not material:
+                    continue
+
+                first_group = first_group_by_material.setdefault(
+                    material, group_key)
+                if first_group != group_key:
+                    variant_key = (material, group_key)
+                    variant = variant_by_material_group.get(variant_key)
+                    if not variant:
+                        source = ensure_material_backup(material)
+                        variant = source.copy()
+                        variant.name = f"{material.name}_{suffix}"
+                        variant_by_material_group[variant_key] = variant
+                    slot.material = variant
+                    material = variant
+
+                if material in done_in_group:
+                    continue
+                done_in_group.add(material)
+                ensure_material_backup(material)
+                if apply_baked_to_material(
+                        material.name, image, mode,
+                        props.apply_keep_original_nodes,
+                        props.uv_layer_name):
+                    applied += 1
+                else:
+                    skipped += 1
+
+    return applied, skipped
+
+
 def run_apply(obj_names, props, report):
     normalize_core_names(props)
     mode = resolve_apply_mode(props)
     applied = 0
     skipped = 0
 
-    processed_mats = set()
-    for obj_name in obj_names:
-        obj = bpy.data.objects.get(obj_name)
-        if not obj:
-            continue
-        for slot in obj.material_slots:
-            mat = slot.material
-            if not mat or mat.name in processed_mats:
-                continue
-            processed_mats.add(mat.name)
-
-            img = None
-            if props.image_mode == 'ATLAS':
-                img = bpy.data.images.get(f"{props.output_prefix}shared")
-            elif props.image_mode == 'PER_MATERIAL':
-                img = bpy.data.images.get(f"{props.output_prefix}{mat.name}")
-
-            if not img:
-                img = bpy.data.images.get(f"{props.output_prefix}shared")
-            if not img:
-                img = bpy.data.images.get(f"{props.output_prefix}{mat.name}")
-
-            if not img:
+    if not uses_image_bake_target(props):
+        processed_mats = set()
+        for obj_name in obj_names:
+            obj = bpy.data.objects.get(obj_name)
+            attribute = get_bake_color_attribute(obj)
+            if not obj or not attribute:
                 skipped += 1
                 continue
+            for slot in obj.material_slots:
+                mat = slot.material
+                if not mat or mat.name in processed_mats:
+                    continue
+                processed_mats.add(mat.name)
+                ensure_material_backup(mat)
+                if apply_baked_color_to_material(
+                        mat.name, attribute.name, mode,
+                        props.apply_keep_original_nodes):
+                    applied += 1
+                else:
+                    skipped += 1
 
-            backup_name = f"{mat.name}_AHB_backup"
-            if not bpy.data.materials.get(backup_name):
-                backup = mat.copy()
-                backup.name = backup_name
+    elif props.image_mode == 'AUTO_TILES':
+        groups = []
+        for tile_idx, tile_obj_names in get_existing_tile_groups(obj_names, props):
+            image = bpy.data.images.get(
+                f"{props.output_prefix}tile_{tile_idx + 1:02d}")
+            if not image:
+                report({'WARNING'}, f"No image for tile {tile_idx + 1}")
+            groups.append((
+                tile_idx, f"tile{tile_idx + 1:02d}", tile_obj_names, image))
+        applied, skipped = apply_grouped_bake_images(groups, props, mode)
 
-            success = apply_baked_to_material(
-                mat.name, img, mode,
-                props.apply_keep_original_nodes,
-                props.uv_layer_name)
-            if success:
-                applied += 1
-            else:
-                skipped += 1
+    elif props.image_mode == 'COLLECTION_ATLASES':
+        groups = []
+        for atlas_number, atlas_obj_names in get_atlas_groups(
+                obj_names, props, report):
+            if not atlas_obj_names:
+                continue
+            atlas_name = get_collection_atlas_name(props, atlas_number)
+            image = bpy.data.images.get(f"{props.output_prefix}{atlas_name}")
+            if not image:
+                report({'WARNING'}, f"No baked image for {atlas_name}")
+            groups.append((
+                atlas_number, f"atlas{atlas_number:02d}",
+                atlas_obj_names, image))
+        applied, skipped = apply_grouped_bake_images(groups, props, mode)
+
+    else:
+        processed_mats = set()
+        for obj_name in obj_names:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj:
+                continue
+            for slot in obj.material_slots:
+                mat = slot.material
+                if not mat or mat.name in processed_mats:
+                    continue
+                processed_mats.add(mat.name)
+
+                image = None
+                if props.image_mode == 'ATLAS':
+                    image = bpy.data.images.get(f"{props.output_prefix}shared")
+                elif props.image_mode == 'PER_MATERIAL':
+                    image = bpy.data.images.get(f"{props.output_prefix}{mat.name}")
+                if not image:
+                    image = bpy.data.images.get(f"{props.output_prefix}shared")
+                if not image:
+                    image = bpy.data.images.get(f"{props.output_prefix}{mat.name}")
+                if not image:
+                    skipped += 1
+                    continue
+
+                ensure_material_backup(mat)
+                if apply_baked_to_material(
+                        mat.name, image, mode,
+                        props.apply_keep_original_nodes,
+                        props.uv_layer_name):
+                    applied += 1
+                else:
+                    skipped += 1
 
     mode_label = 'Emission' if mode == 'EMISSION' else 'Base Color'
     msg = f"Applied {applied} material(s) as {mode_label}. Skipped: {skipped}"
@@ -1836,6 +2544,7 @@ def restore_material_backups(obj_names):
         if modified.users == 0:
             bpy.data.materials.remove(modified)
         restored += 1
+    restore_image_uv_backups(obj_names)
     return restored
 
 
