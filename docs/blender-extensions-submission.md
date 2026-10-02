@@ -8,12 +8,13 @@ This document covers preparing, building, verifying, and manually submitting **W
 
 - [x] **`blender_manifest.toml` Metadata Valid**: Contains `schema_version`, `id`, `version`, `name`, `tagline`, `maintainer`, `type`, `blender_version_min`, `license`, `tags`, and `[permissions]`.
 - [x] **License Compliant**: Licensed under `SPDX:GPL-3.0-or-later`.
-- [x] **Version Consistency**: Version `1.0.0` matches across `blender_manifest.toml`, `version.py`, and documentation.
+- [x] **Version Consistency**: `blender_manifest.toml` is the single source of truth; the build script reads it to name the artifact.
 - [x] **Blender Compatibility**: Verified against Blender 5.1+.
 - [x] **Package Structure**: Extension archive contains `blender_manifest.toml` and code at the root of `dist/web3d_asset_compiler-1.0.0.zip`.
-- [x] **No Forbidden Development Files**: `.git`, `.github`, `tests/`, `docs/`, `scripts/`, `imported_source/`, `.blend`, `.pyc`, and `__pycache__` are excluded from the distribution artifact.
+- [x] **No Forbidden Development Files**: `__pycache__`, `.git`, `.github`, `.venv`, `venv`, `dist`, `build`, `.blend`, and `.pyc` are excluded from the distribution artifact.
 - [x] **No Secrets or Hardcoded Machine Paths**: Scanned and verified clean.
-- [x] **Graceful Dependencies**: Optional tools (UVPackmaster, Draco) degrade gracefully without breaking extension registration or core functionality.
+- [x] **Graceful Dependencies**: Optional tools (Draco) degrade gracefully without breaking extension registration or core functionality.
+- [x] **No Bundled Third-Party Binaries**: Atlas packing uses Blender's own packer only.
 - [x] **Clean Installation & Uninstallation**: Registration and unregistration tested cleanly in headless Blender 5.1 without errors or memory leaks.
 - [x] **Baking & Exporter Subsystems Verified**: Auto HDR Baker and Three.js Exporter operators verified active and working.
 
@@ -24,6 +25,7 @@ This document covers preparing, building, verifying, and manually submitting **W
 Run the automated extension build script:
 
 ```bash
+blender --command extension validate addon/web3d_asset_compiler --valid-tags=""
 python scripts/build_extension.py
 ```
 

@@ -29,20 +29,11 @@ _SHAPE_KEY_VALUE_RE = re.compile(
 
 
 def iter_action_fcurve_collections(action):
-    """Yield each F-curve collection for legacy and Blender 5 slotted Actions."""
-    found_slotted_curves = False
-    for layer in getattr(action, "layers", []):
+    """Yield each F-curve collection for Blender 5 slotted Actions."""
+    for layer in action.layers:
         for strip in layer.strips:
-            for channelbag in getattr(strip, "channelbags", []):
-                found_slotted_curves = True
+            for channelbag in strip.channelbags:
                 yield channelbag.fcurves
-
-    if found_slotted_curves:
-        return
-    try:
-        yield action.fcurves
-    except (AttributeError, RuntimeError):
-        pass
 
 
 def _target_length(data_path):

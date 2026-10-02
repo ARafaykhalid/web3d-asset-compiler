@@ -9,6 +9,7 @@ from .uv_utils import (
     copy_image_uv_backup,
     preserve_implicit_texture_uvs,
     restore_image_uv_backups,
+    island_bounds_and_gap,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     'copy_image_uv_backup',
     'preserve_implicit_texture_uvs',
     'restore_image_uv_backups',
+    'island_bounds_and_gap',
 ]

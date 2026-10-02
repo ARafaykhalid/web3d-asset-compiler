@@ -1,4 +1,4 @@
-name: CI - Addon Validation & Build
+name: CI
 
 on:
   push:
@@ -9,30 +9,58 @@ on:
 jobs:
   validate-and-build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
-      - name: Validate Addon Code & Syntax
-        run: |
-          python scripts/validate_addon.py
-
-      - name: Run Package Structure Unit Tests
-        run: |
-          python -m unittest discover -s tests
-
-      - name: Build Installable Addon ZIP
-        run: |
-          python scripts/build_addon.py
-
-      - name: Upload Addon Artifact
-        uses: actions/upload-artifact@v4
+      - name: Cache Blender
+        id: cache
+        uses: actions/cache@v4
         with:
-          name: web3d_asset_compiler_zip
-          path: dist/web3d_asset_compiler.zip
+          path: ~/blender
+          key: blender-5.2.2-linux-x64
+
+      - name: Download Blender
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/blender
+          curl -fL --retry 5 --retry-all-errors \
+            "https://download.blender.org/release/Blender5.2/blender-5.2.2-linux-x64.tar.xz" \
+            | tar -xJ -C ~/blender --strip-components=1
+
+      - name: Validate extension manifest with Blender
+        run: |
+          ~/blender/blender --command extension validate \
+            addon/web3d_asset_compiler --valid-tags=""
+
+      - name: Reject hardcoded local paths
+        run: |
+          ! grep -rnE '["'"'"']([a-zA-Z]:\\Users\\|/Users/|/home/)[^"'"'"']*' addon/
+
+      - name: End-to-end tests in real Blender
+        run: |
+          ~/blender/blender --background --factory-startup -noaudio \
+            --python-exit-code 1 --python tests/test_blender_pipeline_smoke.py
+
+      - name: Draw every UI panel with a real layout
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq xvfb
+          xvfb-run -a ~/blender/blender --factory-startup --python-exit-code 1 \
+            --python tests/test_ui_draw.py
+
+      - name: Typecheck the web examples against exporter output
+        run: |
+          ~/blender/blender --background --factory-startup -noaudio \
+            --python-exit-code 1 --python tests/export_fixtures.py
+          cd examples && npm install --no-audit --no-fund && npx tsc --noEmit
+
+      - name: Build installable extension ZIP
+        run: python scripts/build_extension.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web3d_asset_compiler-1.0.0.zip
+          path: dist/web3d_asset_compiler-1.0.0.zip

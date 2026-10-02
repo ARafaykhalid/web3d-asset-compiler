@@ -1164,17 +1164,9 @@ def _quantization_allowed(props, property_name):
     if property_name == "quaternion":
         return getattr(props, "quantize_quaternions", True)
     if property_name == "position":
-        return getattr(
-            props,
-            "quantize_positions",
-            getattr(props, "quantize_vectors", True),
-        )
+        return getattr(props, "quantize_positions", True)
     if property_name == "scale":
-        return getattr(
-            props,
-            "quantize_scales",
-            getattr(props, "quantize_vectors", True),
-        )
+        return getattr(props, "quantize_scales", True)
     return getattr(props, "quantize_morphs", True)
 
 

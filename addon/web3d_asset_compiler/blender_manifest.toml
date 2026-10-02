@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "web3d_asset_compiler"
-version = "1.0.0"
+version = "1.1.0"
 name = "Web3D Asset Compiler"
 tagline = "Lightmap baking, mesh optimization, and Three.js export"
 maintainer = "Abdul Rafay Khalid <abdulrafaykhalid@gmail.com>"
@@ -12,7 +12,6 @@ license = [
 website = "https://github.com/ARafayKhalid/web3d-asset-compiler"
 tags = [
     "Import-Export",
-    "3D View",
     "Material",
 ]
 

@@ -14,32 +14,6 @@ from bpy.props import (
 from bpy.types import PropertyGroup
 
 
-def _get_quantize_positions(props):
-    return bool(
-        props.get(
-            "quantize_positions",
-            props.get("quantize_vectors", True),
-        )
-    )
-
-
-def _set_quantize_positions(props, value):
-    props["quantize_positions"] = bool(value)
-
-
-def _get_quantize_scales(props):
-    return bool(
-        props.get(
-            "quantize_scales",
-            props.get("quantize_vectors", True),
-        )
-    )
-
-
-def _set_quantize_scales(props, value):
-    props["quantize_scales"] = bool(value)
-
-
 class TJS_Properties(PropertyGroup):
     portfolio_one_click: BoolProperty(
         name="Portfolio One-Click Export",
@@ -139,16 +113,8 @@ class TJS_Properties(PropertyGroup):
     remove_static_tracks: BoolProperty(name="Remove Rest-Pose Tracks", default=True)
     enable_animation_quantization: BoolProperty(name="Quantize Animation Data", default=True)
     quantize_quaternions: BoolProperty(name="Int16 Quaternions", default=True)
-    quantize_positions: BoolProperty(
-        name="Uint16 Positions",
-        get=_get_quantize_positions,
-        set=_set_quantize_positions,
-    )
-    quantize_scales: BoolProperty(
-        name="Uint16 Scales",
-        get=_get_quantize_scales,
-        set=_set_quantize_scales,
-    )
+    quantize_positions: BoolProperty(name="Uint16 Positions", default=True)
+    quantize_scales: BoolProperty(name="Uint16 Scales", default=True)
     quantize_morphs: BoolProperty(name="Uint16 Morph Values", default=True)
     export_all_actions: BoolProperty(name="Export All Actions", default=True)
     exclude_actions: StringProperty(

@@ -70,35 +70,6 @@ def _uses_armature(obj, armature):
     )
 
 
-def _character_export_readiness(context, scoped_objects):
-    scoped = set(scoped_objects)
-    armatures = {obj for obj in scoped if obj.type == "ARMATURE"}
-    for obj in scoped:
-        parent = obj.parent
-        while parent:
-            if parent.type == "ARMATURE":
-                armatures.add(parent)
-            parent = parent.parent
-        if _is_mesh(obj):
-            armatures.update(
-                modifier.object
-                for modifier in obj.modifiers
-                if modifier.type == "ARMATURE" and modifier.object
-            )
-
-    if not armatures:
-        return False, "Export: character armature not found"
-
-    for armature in armatures:
-        meshes = [
-            obj for obj in context.scene.objects
-            if _uses_armature(obj, armature)
-        ]
-        if meshes:
-            return True, f"Export: armature with {len(meshes)} skinned mesh(es)"
-    return False, "Export: no scoped mesh is skinned to the armature"
-
-
 def _bake_readiness(context, props):
     if (
         getattr(props, "bake_target", "IMAGE_TEXTURES") == "IMAGE_TEXTURES"
@@ -344,6 +315,13 @@ def draw_compile_overview(layout, context, compact=False):
     status_box = layout.box()
     _draw_current_status(status_box, context)
 
+    # The runners yield between steps, so the window is live while a build
+    # runs and this button is actually clickable.
+    if getattr(context.scene.ahb_props, "web3d_cancel_pending", False):
+        status_box.separator()
+        status_box.operator(
+            "web3d.cancel_build", text="Cancel Build", icon="CANCEL")
+
     if not compact:
         readiness = layout.column(align=True)
         bake_ready, export_ready, animated = _draw_readiness(readiness, context)
@@ -542,14 +520,11 @@ def draw_uv_settings(layout, context):
     layout.prop(ahb, "pack_enabled")
     packing = layout.column(align=True)
     packing.enabled = ahb.pack_enabled
-    packing.prop(ahb, "pack_engine")
     packing.prop(ahb, "pack_world_scale")
     packing.prop(ahb, "pack_image_boost", text="Texture Density Boost")
 
-    packing.prop(ahb, "pack_margin_px", text="Margin (px)")
+    packing.prop(ahb, "pack_margin_px", text="Gutter (px)")
     blender_packing = packing.column(align=True)
-    blender_packing.enabled = ahb.pack_engine == "BLENDER"
-    blender_packing.label(text="Blender Native Options")
     blender_packing.prop(ahb, "pack_iterations", text="Iterations")
     blender_packing.prop(ahb, "pack_rotate")
     if ahb.pack_rotate:

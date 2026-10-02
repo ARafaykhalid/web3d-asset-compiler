@@ -111,3 +111,25 @@ class WEB3D_OT_BuildWebAsset(Operator):
             context.scene.web3d_status = msg
             self.report({'ERROR'}, msg)
             return {'CANCELLED'}
+
+
+class WEB3D_OT_CancelBuild(Operator):
+    """Abort the running build at the next step boundary"""
+
+    bl_idname = "web3d.cancel_build"
+    bl_label = "Cancel Build"
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        # Only meaningful while a build is actually in flight. The runners
+        # clear this flag when they finish, so it doubles as "is running".
+        return bool(getattr(context.scene.ahb_props, "web3d_cancel_pending", False))
+
+    def execute(self, context):
+        props = context.scene.ahb_props
+        props.web3d_cancel = True
+        props.web3d_cancel_pending = False
+        context.scene.web3d_status = "Cancelling…"
+        self.report({'INFO'}, "Cancelling at the next step…")
+        return {'FINISHED'}

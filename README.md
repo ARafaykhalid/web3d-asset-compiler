@@ -33,7 +33,6 @@ Designed specifically for:
 - **HDR & LDR Formats**: 8/16-bit PNG, JPEG, TIFF, Radiance HDR (`.hdr`), and 32-bit float OpenEXR (`.exr`) with compression codecs (ZIP, ZIPS, PIZ, RLE, B44, DWAA).
 - **Automated UV Unwrapping**: Smart UV Project, Auto Seam Unwrap (angle-based sharp edge seam marking), Cube Project, Lightmap Pack, Standard Unwrap, or Existing UVs.
 - **World-Space Proportional Packing**: Maintains consistent texel density (pixels per meter) across small trim pieces and large walls. Includes image texture space boost multipliers.
-- **Third-Party Packer Integration**: Native support for **UVPackmaster 2 / 3** with automatic fallback to Blender native packing.
 - **Cycles Hardware Acceleration**: Automatic Cycles compute selection for NVIDIA OptiX / CUDA, AMD HIP, Intel oneAPI, and Apple Metal.
 - **Non-Destructive Material Application**: One-click toggle between pre-lit baked textures and original procedural shader graphs.
 - **JSON Import/Export**: Save and reload complete material and bake metadata.
@@ -50,7 +49,7 @@ Designed specifically for:
 
 ## Supported Versions & Export Targets
 
-- **Blender Version**: 5.1.0 or higher
+- **Blender Version**: 5.1.0 or higher (tested against 5.2.2 LTS)
 - **Maintainer**: Abdul Rafay Khalid (`ARafayKhalid`)
 - **Supported Export Targets**:
   - Three.js (r150+)
@@ -62,11 +61,11 @@ Designed specifically for:
 
 ## Installation
 
-1. Download `web3d_asset_compiler-1.0.0.zip` from [Releases](https://github.com/ARafayKhalid/web3d-asset-compiler/releases) (or build locally).
+1. Download the latest `web3d_asset_compiler-<version>.zip` from [Releases](https://github.com/ARafayKhalid/web3d-asset-compiler/releases) (or build locally).
 2. Open Blender 5.1+.
 3. Navigate to **Edit ➔ Preferences ➔ Extensions** (or **Get Extensions**).
 4. Click the top-right menu and select **Install from Disk...**
-5. Select `web3d_asset_compiler-1.0.0.zip` and enable the extension.
+5. Select the downloaded `.zip` and enable the extension.
 6. Access the panel in the 3D Viewport N-Panel under the **Web3D** tab or in **Properties ➔ Render**.
 
 ---
@@ -99,7 +98,6 @@ web3d-asset-compiler/
 │   └── web3d_asset_compiler/   # Complete installable Blender extension package
 │       ├── blender_manifest.toml# Official Blender extension manifest
 │       ├── __init__.py         # Addon entrypoint
-│       ├── version.py          # Version metadata (v1.0.0, Abdul Rafay Khalid)
 │       ├── baking/             # Auto HDR Baker system
 │       ├── exporter/           # Three.js Exporter system
 │       ├── presets/            # Optimization preset definitions
@@ -120,13 +118,11 @@ web3d-asset-compiler/
 │   └── sample_threejs_loader.ts
 │
 ├── scripts/                    # Extension build & validation tooling
-│   ├── build_extension.py      # Packages dist/web3d_asset_compiler-1.0.0.zip
-│   └── validate_extension.py   # Validates TOML manifest, syntax, and cleanliness
+│   └── build_extension.py      # Packages dist/web3d_asset_compiler-<version>.zip
 │
-└── tests/                      # Automated Python and headless Blender tests
-    ├── test_package_structure.py
-    ├── test_extension_manifest.py
-    └── test_blender_addon_register.py
+└── tests/                      # Headless Blender end-to-end tests
+    ├── test_blender_addon_register.py
+    └── test_blender_pipeline_smoke.py
 ```
 
 ---
@@ -136,11 +132,19 @@ web3d-asset-compiler/
 To package the installable Extension ZIP file:
 
 ```bash
+blender --command extension validate addon/web3d_asset_compiler --valid-tags=""
 python scripts/build_extension.py
 ```
 
 Output archive:
-`dist/web3d_asset_compiler-1.0.0.zip`
+`dist/web3d_asset_compiler-1.1.0.zip`
+
+Run the test suite the same way CI does:
+
+```bash
+blender --background --factory-startup -noaudio \
+  --python-exit-code 1 --python tests/test_blender_pipeline_smoke.py
+```
 
 ---
 

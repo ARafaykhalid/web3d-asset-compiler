@@ -5,6 +5,7 @@ Executed with: blender --background --python tests/test_blender_addon_register.p
 
 import sys
 import os
+import tomllib
 import unittest
 
 try:
@@ -29,10 +30,20 @@ class TestBlenderAddonRegister(unittest.TestCase):
         print("==================================================")
 
         import web3d_asset_compiler
-        print(f"[OK] Successfully imported web3d_asset_compiler")
-        print(f"  Addon Name: {web3d_asset_compiler.bl_info['name']}")
-        print(f"  Version:    {web3d_asset_compiler.bl_info['version']}")
-        
+        print("[OK] Successfully imported web3d_asset_compiler")
+
+        # Metadata lives in blender_manifest.toml; bl_info is the legacy-addon
+        # path and is ignored for extensions (Blender 4.2+).
+        manifest_path = os.path.join(
+            ADDON_PARENT_DIR, "web3d_asset_compiler", "blender_manifest.toml")
+        with open(manifest_path, "rb") as handle:
+            manifest = tomllib.load(handle)
+        print(f"  Name:    {manifest['name']}")
+        print(f"  Version: {manifest['version']}")
+        self.assertFalse(
+            hasattr(web3d_asset_compiler, "bl_info"),
+            "bl_info should not be present in an extension package")
+
         # Test register()
         web3d_asset_compiler.register()
         print("[OK] Successfully executed register()")

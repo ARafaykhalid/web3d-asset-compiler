@@ -197,15 +197,6 @@ class AHB_Properties(PropertyGroup):
 
     # Island Packing
     pack_enabled: BoolProperty(name="Pack Islands After Unwrap", default=True)
-    pack_engine: EnumProperty(
-        name="Pack Engine",
-        items=[
-            ('BLENDER', 'Blender Native', 'Use built-in Blender packing'),
-            ('UVP3',    'UVPackmaster 3', 'Use UVPackmaster 3 (Must be installed)'),
-            ('UVP2',    'UVPackmaster 2', 'Use UVPackmaster 2 (Must be installed)'),
-        ],
-        default='BLENDER',
-    )
     pack_rotate: BoolProperty(name="Allow Rotation", default=True)
     pack_rotation_step: EnumProperty(
         name="Rotation Mode",
@@ -224,11 +215,14 @@ class AHB_Properties(PropertyGroup):
     pack_shape_method: EnumProperty(
         name="Shape Method",
         items=[
-            ('CONVEX',  'Convex',   'Convex hull (tight packing, NO overlaps)'),
-            ('CONCAVE', 'Concave',  'Accurate concave hull'),
+            # CONCAVE is Blender's own default. CONVEX is the least-tested
+            # packer path and tripped a BLI_assert on a plain cube in 5.2.0
+            # (upstream #157473), so it is available but not the default.
+            ('CONCAVE', 'Concave',  'Accurate concave hull (tightest fit)'),
+            ('CONVEX',  'Convex',   'Convex hull (faster, slightly larger)'),
             ('AABB',    'Bounding Box', 'Axis-aligned bounding box'),
         ],
-        default='CONVEX',
+        default='CONCAVE',
     )
     pack_scale_islands: BoolProperty(name="Scale Islands to Fit Gaps", default=False)
     pack_stack_identical: BoolProperty(name="Stack Identical Islands", default=False)
@@ -329,6 +323,38 @@ class AHB_Properties(PropertyGroup):
     # Cleanup & Apply
     auto_cleanup_nodes: BoolProperty(name="Auto Clean Bake Nodes", default=True)
     baked_view: BoolProperty(name="Baked View", default=False)
+    bake_cancelled: BoolProperty(
+        name="Bake Cancelled",
+        description="Set when the user aborted the bake with ESC",
+        default=False,
+    )
+    web3d_cancel: BoolProperty(
+        name="Cancel Requested",
+        description="Internal: set by the Cancel button, checked between steps",
+        default=False,
+        options={'HIDDEN'},
+    )
+    uv_gutter_px: FloatProperty(
+        name="Achieved Gutter (px)",
+        # -1 means "not measured yet". 0 is a real, achievable measurement: a
+        # dense atlas genuinely gets no gutter, and treating that as unknown
+        # would leave the bake margin far wider than the gap it sits in.
+        description="Gutter the last UV pack actually achieved, in pixels",
+        default=-1.0,
+        options={'HIDDEN'},
+    )
+    pack_verified: BoolProperty(
+        name="UV Pack Verified",
+        description="Result of the last UV pack validation pass",
+        default=False,
+        options={'HIDDEN'},
+    )
+    web3d_cancel_pending: BoolProperty(
+        name="Build Running",
+        description="Internal: true while a build is in flight",
+        default=False,
+        options={'HIDDEN'},
+    )
     apply_mode: EnumProperty(
         name="Apply Mode",
         items=[

@@ -8,7 +8,6 @@ This document details the architectural layout of **Web3D Asset Compiler**.
 addon/web3d_asset_compiler/
 ├── __init__.py         # Addon entrypoint & idempotent class registration
 ├── blender_manifest.toml # Extension platform manifest
-├── version.py          # Version metadata (Single Source of Truth)
 ├── baking/             # Auto HDR Baker system
 │   ├── properties.py   # AHB_Properties definition
 │   ├── pipeline.py     # Baking execution, Cycles compute, UV packing, image saving
@@ -34,14 +33,13 @@ addon/web3d_asset_compiler/
     └── logging_utils.py# Safe filenames & UI redraw helpers
 
 scripts/
-├── build_extension.py    # Packages dist/web3d_asset_compiler-1.0.0.zip
-└── validate_extension.py # Validates manifest, metadata, and syntax
+└── build_extension.py    # Packages dist/web3d_asset_compiler-<version>.zip
 
 tests/
 ├── test_blender_addon_register.py # Registration & operator coverage test
 ├── test_blender_pipeline_smoke.py  # Headless baking & export pipeline smoke test
-├── test_extension_manifest.py     # Manifest validation unittest
-└── test_package_structure.py      # Package file layout unittest
+├── test_blender_addon_register.py
+└── test_blender_pipeline_smoke.py
 ```
 
 ## Data Flow & Execution Pipeline
@@ -53,7 +51,7 @@ tests/
    [ 1. Preserve Source UVs & Materials ]
                │
                ▼
-   [ 2. Generate UVs & Pack Islands ] ──► UVPackmaster / Blender Native
+   [ 2. Generate UVs & Pack Islands ] ──► verify gutter + bounds
                │
                ▼
    [ 3. Configure Cycles Compute ] ──► OptiX / CUDA / HIP / Metal / CPU

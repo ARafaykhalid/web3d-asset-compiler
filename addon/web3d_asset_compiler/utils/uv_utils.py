@@ -11,7 +11,7 @@ DEFAULT_BAKE_NODE_TAG = "AHB_BakeTarget"
 
 
 def _bake_node_tag(tag):
-    tag = str(tag).strip() if tag is not None else ""
+    tag = str(tag or "").strip()
     return tag or DEFAULT_BAKE_NODE_TAG
 
 
@@ -189,3 +189,161 @@ def restore_image_uv_backups(obj_names, bake_tag=DEFAULT_BAKE_NODE_TAG):
         restored += 1
 
     return restored
+
+
+def _uv_island_bounds(obj_names, layer_name):
+    """Axis-aligned bounds per UV island.
+
+    Islands are found by *UV connectivity*, not by `edge.seam`. In Blender 5.2
+    `bpy.ops.uv.smart_project` marks no seams at all (measured: zero seams and
+    zero sharp edges on a plain cube); it splits islands purely by separating
+    coincident UVs. Walking seams therefore merges every face of an object into
+    one island, which reported a zero gutter for a correctly packed atlas.
+
+    Two faces are in the same island when they share a mesh edge and the UVs on
+    both sides of that edge are identical. `BMEdge` exposes no loop accessor in
+    5.2, so the pairs are collected from the face loops directly.
+    """
+    import bmesh
+
+    EPS = 1e-6
+    bounds = []
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if not obj or obj.type != 'MESH' or layer_name not in obj.data.uv_layers:
+            continue
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(obj.data)
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.get(layer_name)
+            if not uv_layer:
+                continue
+
+            edge_faces = {}
+            edge_uvs = {}
+            for face in bm.faces:
+                loops = face.loops
+                count = len(loops)
+                for index in range(count):
+                    here = loops[index]
+                    nxt = loops[(index + 1) % count]
+                    a, b = here.vert.index, nxt.vert.index
+                    key = (a, b) if a <= b else (b, a)
+                    edge_faces.setdefault(key, []).append(face.index)
+                    edge_uvs.setdefault(key, []).append(
+                        (here[uv_layer].uv, nxt[uv_layer].uv))
+
+            neighbours = {face.index: [] for face in bm.faces}
+            for key, faces in edge_faces.items():
+                if len(faces) != 2:
+                    continue  # boundary or non-manifold: an island edge
+                pairs = edge_uvs.get(key, [])
+                if len(pairs) != 2:
+                    continue
+                (u1, v1), (u2, v2) = pairs
+                if (abs(u1.x - u2.x) <= EPS and abs(u1.y - u2.y) <= EPS
+                        and abs(v1.x - v2.x) <= EPS and abs(v1.y - v2.y) <= EPS):
+                    neighbours[faces[0]].append(faces[1])
+                    neighbours[faces[1]].append(faces[0])
+
+            visited = set()
+            for face in bm.faces:
+                if face.index in visited:
+                    continue
+                stack = [face.index]
+                xs, ys = [], []
+                while stack:
+                    index = stack.pop()
+                    if index in visited:
+                        continue
+                    visited.add(index)
+                    for loop in bm.faces[index].loops:
+                        xs.append(loop[uv_layer].uv.x)
+                        ys.append(loop[uv_layer].uv.y)
+                    stack.extend(neighbours[index])
+                if xs and ys:
+                    bounds.append((min(xs), max(xs), min(ys), max(ys)))
+        finally:
+            bm.free()
+    return bounds
+
+
+def _min_box_gap(boxes):
+    """Smallest distance between any two boxes. None when there is only one."""
+    best = float('inf')
+    for index, a in enumerate(boxes):
+        for b in boxes[index + 1:]:
+            du = max(b[0] - a[1], a[0] - b[1], 0.0)
+            dv = max(b[2] - a[3], a[2] - b[3], 0.0)
+            distance = (du * du + dv * dv) ** 0.5
+            if distance < best:
+                best = distance
+    return None if best == float('inf') else best
+
+
+def island_bounds_and_gap(obj_names, layer_name, target_gap=0.0):
+    """Return (gap_uv, uv_min, uv_max, island_count) for a group.
+
+    gap_uv is the smallest distance between the bounds of two different UV
+    islands, clamped to `target_gap`: it answers "is the gutter at least this
+    wide?", which is the question a lightmap atlas has to get right. Pass the
+    target as `target_gap` in UV units for the fast and exact result.
+
+    `target_gap` also sizes the spatial hash, which is what keeps this cheap:
+    any pair closer than the target must share or neighbour a cell, so a 3x3
+    scan is exhaustive for the distances that matter. A global minimum would
+    need an unbounded neighbourhood and an O(n^2) scan.
+
+    Blender's own overlap test cannot measure this. `bpy.ops.uv.select_overlap`
+    applies a *relative* along-the-edge bias to avoid shared-vertex false
+    positives, so islands 0.005 UV apart still read as "not overlapping".
+    """
+    boxes = _uv_island_bounds(obj_names, layer_name)
+    if not boxes:
+        return None, 0.0, 0.0, 0
+
+    xs = [v for a in boxes for v in (a[0], a[1])]
+    uv_min, uv_max = min(xs), max(xs)
+    if len(boxes) == 1:
+        return target_gap, uv_min, uv_max, 1
+
+    span = max(uv_max - uv_min, 1e-9)
+    if target_gap <= 0.0:
+        # No target means the caller wants the true global minimum, which the
+        # bounded scan below cannot give. Fall back to brute force rather than
+        # returning a "close enough" zero that reads as overlapping.
+        best = _min_box_gap(boxes)
+        return best, uv_min, uv_max, len(boxes)
+
+    cell = max(target_gap, span / 512.0, 1e-9)
+    grid = {}
+    for index, box in enumerate(boxes):
+        for cu in range(int((box[0] - uv_min) / cell),
+                        int((box[1] - uv_min) / cell) + 1):
+            for cv in range(int((box[2] - uv_min) / cell),
+                            int((box[3] - uv_min) / cell) + 1):
+                grid.setdefault((cu, cv), []).append(index)
+
+    best = float('inf')
+    for (cu, cv), members in grid.items():
+        neighbours = []
+        for ou in (-1, 0, 1):
+            for ov in (-1, 0, 1):
+                neighbours.extend(grid.get((cu + ou, cv + ov), ()))
+        for i in members:
+            a = boxes[i]
+            for j in neighbours:
+                if j <= i:
+                    continue
+                b = boxes[j]
+                du = max(b[0] - a[1], a[0] - b[1], 0.0)
+                dv = max(b[2] - a[3], a[2] - b[3], 0.0)
+                d = (du * du + dv * dv) ** 0.5
+                if d < best:
+                    best = d
+
+    # Nothing closer than one cell: the gutter is at least the target.
+    if best == float('inf'):
+        return target_gap, uv_min, uv_max, len(boxes)
+    return best, uv_min, uv_max, len(boxes)

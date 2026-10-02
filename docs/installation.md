@@ -11,7 +11,7 @@ This guide covers installing and configuring **Web3D Asset Compiler** in Blender
 ## Step-by-Step Installation
 
 1. **Download Release**:
-   Download `web3d_asset_compiler.zip` from the GitHub Releases page, or build it locally using `python scripts/build_addon.py`.
+   Download `web3d_asset_compiler-1.0.0.zip` from the GitHub Releases page, or build it locally using `python scripts/build_extension.py`.
 
 2. **Open Blender**:
    Launch Blender 5.1+.
@@ -24,7 +24,7 @@ This guide covers installing and configuring **Web3D Asset Compiler** in Blender
 
 5. **Install Addon**:
    - Click **Install...** (or **Install from Disk...**) at the top right of the Preferences window.
-   - Browse to your downloaded `web3d_asset_compiler.zip` file and select it.
+   - Browse to your downloaded `web3d_asset_compiler-1.0.0.zip` file and select it.
    - Click **Install Add-on**.
 
 6. **Enable Addon**:
@@ -38,5 +38,10 @@ This guide covers installing and configuring **Web3D Asset Compiler** in Blender
 
 ## Optional External Integrations
 
-- **UVPackmaster 2 / 3**:
-  If installed in Blender, select `UVPackmaster 3` or `UVPackmaster 2` under **UV Generation & Packing ➔ Pack Engine**. If not present, the addon automatically uses Blender's native packing system.
+- **Draco mesh compression** (export only): enabled per-export under
+  **Export ➔ Mesh Compression**. When Blender's glTF exporter has Draco
+  available it is used; otherwise the export falls back to uncompressed mesh
+  data and says so.
+
+Atlas packing always uses Blender's own UV packer. No third-party packer is
+installed, downloaded, or called.

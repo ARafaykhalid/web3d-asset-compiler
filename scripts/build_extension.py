@@ -1,86 +1,79 @@
 """
-Blender Extension Packaging Script for extensions.blender.org.
-Generates dist/web3d_asset_compiler-1.0.0.zip ready for submission.
+Package Web3D Asset Compiler as an installable Blender extension ZIP.
+
+Manifest validation is Blender's job -- run it with:
+    blender --command extension validate addon/web3d_asset_compiler
+CI does that before calling this script.
 """
 
+import ast
 import os
 import sys
-import shutil
+import tomllib
 import zipfile
-from validate_extension import validate_extension, MANIFEST_PATH
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ADDON_SOURCE_DIR = os.path.join(REPO_ROOT, "addon", "web3d_asset_compiler")
+ADDON_DIR = os.path.join(REPO_ROOT, "addon", "web3d_asset_compiler")
 DIST_DIR = os.path.join(REPO_ROOT, "dist")
-ZIP_PATH = os.path.join(DIST_DIR, "web3d_asset_compiler-1.0.0.zip")
 
-EXCLUDED_EXTENSIONS = {".pyc", ".pyo", ".blend", ".blend1", ".blend2", ".git", ".DS_Store", ".tmp"}
-EXCLUDED_NAMES = {"__pycache__", ".git", ".github", ".venv", "venv", "dist", "build", "tests", "docs", "scripts", "imported_source"}
+SKIP_DIRS = {"__pycache__", ".git", ".github", ".venv", "venv",
+             "dist", "build"}
+SKIP_EXTS = {".pyc", ".pyo", ".blend", ".blend1", ".blend2", ".DS_Store"}
+
+
+def check_syntax():
+    """Parse every module. ast.parse, not compileall -- compileall writes
+    __pycache__ next to the source, which fails on synced/network folders."""
+    errors = []
+    for root, dirs, files in os.walk(ADDON_DIR):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(root, name)
+            with open(path, "r", encoding="utf-8") as handle:
+                try:
+                    ast.parse(handle.read(), filename=path)
+                except SyntaxError as exc:
+                    errors.append(f"{os.path.relpath(path, REPO_ROOT)}: {exc}")
+    if errors:
+        sys.exit("Syntax errors:\n  " + "\n  ".join(errors))
 
 
 def build_extension():
-    print("==================================================")
-    print("   Building Blender Extension Submission Artifact ")
-    print("==================================================")
+    if not os.path.isfile(os.path.join(ADDON_DIR, "blender_manifest.toml")):
+        sys.exit(f"blender_manifest.toml missing in {ADDON_DIR}")
 
-    # 1. Run validation
-    if not validate_extension():
-        print("\n[X] Extension packaging aborted due to validation failures.")
-        sys.exit(1)
+    check_syntax()
 
-    # 2. Clean previous build
-    if os.path.exists(DIST_DIR):
-        shutil.rmtree(DIST_DIR)
-        print(f"\n[OK] Cleaned output directory: {DIST_DIR}")
+    with open(os.path.join(ADDON_DIR, "blender_manifest.toml"), "rb") as handle:
+        version = tomllib.load(handle)["version"]
+    zip_path = os.path.join(DIST_DIR, f"web3d_asset_compiler-{version}.zip")
+
     os.makedirs(DIST_DIR, exist_ok=True)
-
-    # 3. Package extension ZIP
-    print(f"\nPackaging extension ZIP: {ZIP_PATH}...")
-    archived_files = 0
-    with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in os.walk(ADDON_SOURCE_DIR):
-            # Prune excluded directories
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_NAMES]
-
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                if ext in EXCLUDED_EXTENSIONS or file in EXCLUDED_NAMES:
+    count = 0
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for root, dirs, files in os.walk(ADDON_DIR):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+            for name in files:
+                if os.path.splitext(name)[1].lower() in SKIP_EXTS:
                     continue
+                source = os.path.join(root, name)
+                # Blender expects blender_manifest.toml at the archive root.
+                arc = os.path.relpath(source, ADDON_DIR).replace(os.sep, "/")
+                archive.write(source, arc)
+                count += 1
 
-                abs_file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(abs_file_path, ADDON_SOURCE_DIR)
-                
-                # Blender extensions package layout: manifest and code directly at root of ZIP
-                arc_name = rel_path.replace("\\", "/")
+    with zipfile.ZipFile(zip_path) as archive:
+        if archive.testzip():
+            sys.exit(f"Corrupt archive: {zip_path}")
+        names = archive.namelist()
+        for required in ("blender_manifest.toml", "__init__.py"):
+            if required not in names:
+                sys.exit(f"{zip_path} is missing {required} at the archive root")
 
-                zipf.write(abs_file_path, arc_name)
-                archived_files += 1
-                print(f"  + {arc_name}")
-
-    # 4. Verify ZIP structure and integrity
-    print("\n--------------------------------------------------")
-    print("Verifying extension ZIP archive integrity...")
-    with zipfile.ZipFile(ZIP_PATH, "r") as zipf:
-        test_fail = zipf.testzip()
-        if test_fail:
-            print(f"[X] Corrupt file detected in extension ZIP: {test_fail}")
-            sys.exit(1)
-
-        names = zipf.namelist()
-        has_manifest = "blender_manifest.toml" in names
-        has_init = "__init__.py" in names
-
-        if not has_manifest:
-            print("[X] Submission ZIP missing 'blender_manifest.toml' at archive root!")
-            sys.exit(1)
-        if not has_init:
-            print("[X] Submission ZIP missing '__init__.py' at archive root!")
-            sys.exit(1)
-
-        zip_size_mb = os.path.getsize(ZIP_PATH) / (1024 * 1024)
-        print(f"[OK] Extension ZIP verified ({archived_files} files, {zip_size_mb:.2f} MB)")
-        print(f"\n[SUCCESS] Distributable Extension Artifact Ready:")
-        print(f"         {ZIP_PATH}")
+    size = os.path.getsize(zip_path) / (1024 * 1024)
+    print(f"[OK] {zip_path} ({count} files, {size:.2f} MB)")
 
 
 if __name__ == "__main__":

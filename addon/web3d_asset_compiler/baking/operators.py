@@ -15,12 +15,15 @@ from .pipeline import (
     run_bake,
     run_apply,
     save_and_restore_selection,
+    selection_snapshot,
+    status_reporter,
     restore_material_backups,
     normalize_core_names,
     prepare_mesh_data,
     prepare_material_slots,
     preserve_implicit_texture_uvs,
     setup_atlas_uvs,
+    owned_bake_images,
     get_object_bake_image,
     inject_bake_node,
     remove_bake_nodes,
@@ -37,7 +40,6 @@ from .pipeline import (
     remove_all_uvs,
     clear_and_renew_auto_seams,
     remove_tile_uv_offsets,
-    offset_tile_uvs,
     distribute_tiles,
     get_atlas_groups,
     ensure_uv,
@@ -205,11 +207,25 @@ class AHB_OT_BakeAll(Operator):
         if not obj_names:
             return {'CANCELLED'}
 
-        def work():
-            return run_bake(obj_names, props, context, self.report, source_names)
+        restore = selection_snapshot(context)
 
-        baked, errors = save_and_restore_selection(context, work)
-        return {'FINISHED'} if baked and not errors else {'CANCELLED'}
+        def after_bake(baked, errors):
+            report = status_reporter(props, context.scene)
+            restore()
+            if baked and not errors:
+                report({'INFO'}, f"Baked {baked} object(s).")
+            else:
+                props.status_text = f"Bake finished with {errors} error(s)"
+                report({'ERROR'}, props.status_text)
+
+        try:
+            run_bake(obj_names, props, context, status_reporter(props, context.scene),
+                     source_names, on_done=after_bake)
+        except Exception as e:
+            restore()
+            self.report({'ERROR'}, f"Bake failed: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
 
 
 class AHB_OT_RebakeSelected(Operator):
@@ -239,7 +255,7 @@ class AHB_OT_RebakeSelected(Operator):
                             and o.data.polygons)]
 
         def work():
-            restore_material_backups(obj_names)
+            restore_material_backups(obj_names, props)
             prepare_mesh_data(
                 obj_names,
                 make_unique=(props.auto_create_uv
@@ -279,7 +295,7 @@ class AHB_OT_RebakeSelected(Operator):
             elif not ensure_bake_color_attribute(obj):
                 raise RuntimeError("The object cannot store a bake color attribute")
 
-            if not validate_bake_ready(obj_names, props, self.report):
+            if validate_bake_ready(obj_names, props, self.report) is not None:
                 return False
 
             configure_bake_settings(props, context)
@@ -287,34 +303,58 @@ class AHB_OT_RebakeSelected(Operator):
             props.status_text = f"Rebaking {obj.name} in its existing texture pack…"
             force_ui_redraw()
 
-            do_bake_batch(obj_names, props, context, source_names)
+            def finish_bake():
+                if (uses_image_bake_target(props) and props.auto_save
+                        and getattr(props, 'save_mode', 'EXTERNAL')
+                        == 'EXTERNAL'):
+                    for image in target_images.values():
+                        if image.has_data:
+                            save_image(image, props, context)
 
-            if (uses_image_bake_target(props) and props.auto_save
-                    and getattr(props, 'save_mode', 'EXTERNAL') == 'EXTERNAL'):
-                for image in {image.name: image for image in target_images.values()}.values():
-                    if image.has_data:
-                        save_image(image, props, context)
+                if uses_image_bake_target(props) and props.auto_cleanup_nodes:
+                    remove_bake_nodes(set(target_images), props.image_node_name)
 
-            if uses_image_bake_target(props) and props.auto_cleanup_nodes:
-                remove_bake_nodes(set(target_images), props.image_node_name)
+                applied = apply_single_object_bake(
+                    obj, props, resolve_apply_mode(props),
+                    status_reporter(props, context.scene))
+                if applied == 0:
+                    raise RuntimeError(
+                        "Rebake finished, but no baked material could be applied")
 
-            applied = apply_single_object_bake(
-                obj, props, resolve_apply_mode(props), self.report)
-            if applied == 0:
-                raise RuntimeError(
-                    "Rebake finished, but no baked material could be applied")
+                props.baked_view = True
+                props.status_text = (
+                    f"Rebaked {obj.name} in its existing texture pack.")
+                return True
 
-            props.baked_view = True
-            props.status_text = f"Rebaked {obj.name} in its existing texture pack."
+            # Same job hand-off as the full pipeline: the rebake must not block
+            # the UI, and ESC must abort it.
+            run_bake(
+                obj_names, props, context, status_reporter(props, context.scene),
+                source_names, on_done=lambda _b, _e: _finish_rebake(finish_bake),
+            )
             return True
 
+        def _finish_rebake(finish_bake):
+            report = status_reporter(props, context.scene)
+            try:
+                finish_bake()
+                restore()
+            except Exception as e:
+                print(f"[AHB] Selected rebake error:\n{traceback.format_exc()}")
+                props.status_text = f"Selected rebake failed: {e}"
+                report({'ERROR'}, f"Selected rebake failed: {e}")
+                restore()
+
+        restore = selection_snapshot(context)
         try:
-            ok = save_and_restore_selection(context, work)
+            ok = work()
         except Exception as e:
+            restore()
             print(f"[AHB] Selected rebake error:\n{traceback.format_exc()}")
             props.status_text = f"Selected rebake failed: {e}"
             self.report({'ERROR'}, f"Selected rebake failed: {e}")
             return {'CANCELLED'}
+        restore()
         return {'FINISHED'} if ok else {'CANCELLED'}
 
 
@@ -338,48 +378,91 @@ class AHB_OT_QuickBake(Operator):
         self.report({'INFO'}, f"Starting full pipeline for {len(obj_names)} object(s)…")
         props.status_text = f"Pipeline: {len(obj_names)} object(s)…"
 
-        def work():
-            restored = restore_material_backups(obj_names)
-            if restored:
-                self.report({'INFO'}, f"Restored {restored} original material(s) before rebaking.")
+        restore = selection_snapshot(context)
 
-            ok = run_setup(obj_names, props, self.report)
-            if not ok:
-                props.status_text = "Setup failed!"
-                return False
+        def fail(message):
+            props.status_text = message
+            status_reporter(props, context.scene)({'ERROR'}, message)
+            restore()
+            return {'CANCELLED'}
 
-            baked, errs = run_bake(obj_names, props, context, self.report, source_names)
-            if baked == 0:
-                props.status_text = "Bake failed — 0 objects baked!"
-                return False
-            if errs:
-                props.status_text = f"Bake incomplete — {baked} object(s), {errs} error(s)"
-                return False
-
+        def apply_results():
+            report = status_reporter(props, context.scene)
             props.status_text = "Applying baked textures…"
-            applied, skipped = run_apply(obj_names, props, self.report)
+            applied, skipped = run_apply(obj_names, props, report)
             if applied == 0 or skipped:
-                props.status_text = (
+                return fail(
                     f"Material application incomplete — {applied} applied, "
                     f"{skipped} skipped"
                 )
-                self.report({'ERROR'}, props.status_text)
-                return False
-
             if props.auto_rename_objects:
-                rename_objects_by_texture(obj_names, props, self.report)
-
-            props.status_text = f"Pipeline complete ✓  ({baked} baked, {errs} errors)"
+                rename_objects_by_texture(obj_names, props, report)
             props.baked_view = True
-            return True
+            props.status_text = "Pipeline complete ✓"
+            status_reporter(props, context.scene)({'INFO'}, props.status_text)
+            restore()
+            return {'FINISHED'}
+
+        # Runs from a timer after execute() returns, when the operator's RNA
+        # struct no longer exists -- it must not touch `self`.
+        def after_bake(baked, errs):
+            report = status_reporter(props, context.scene)
+            if props.bake_cancelled:
+                # The user pressed ESC; that is not a failure.
+                fail("Bake cancelled.")
+            elif baked == 0:
+                fail("Bake failed — 0 objects baked!")
+            elif errs:
+                fail(f"Bake incomplete — {baked} object(s), {errs} error(s)")
+            else:
+                try:
+                    apply_results()
+                except Exception as e:
+                    props.status_text = f"Pipeline failed: {e}"
+                    report({'ERROR'}, f"Pipeline failed: {e}")
+                    restore()
+
+        def after_setup(ok):
+            if not ok:
+                cancelled = props.bake_cancelled
+                message = "Setup cancelled." if cancelled else "Setup failed!"
+                props.status_text = message
+                status_reporter(props, context.scene)(
+                    {'WARNING' if cancelled else 'ERROR'}, message)
+                restore()
+                return
+            # Hands off to Blender's job system: the interface stays live and
+            # ESC (or the Cancel button) aborts the bake.
+            try:
+                run_bake(
+                    obj_names, props, context,
+                    status_reporter(props, context.scene),
+                    source_names, on_done=after_bake,
+                )
+            except Exception as e:
+                props.status_text = f"Pipeline failed: {e}"
+                status_reporter(props, context.scene)(
+                    {'ERROR'}, f"Pipeline failed: {e}")
+                restore()
 
         try:
-            ok = save_and_restore_selection(context, work)
+            restored = restore_material_backups(obj_names, props)
+            if restored:
+                self.report(
+                    {'INFO'},
+                    f"Restored {restored} original material(s) before rebaking.")
+            # UV setup yields between steps as well, so it is deferred too and
+            # hands off to the bake from `after_setup`.
+            run_setup(
+                obj_names, props, status_reporter(props, context.scene),
+                on_done=after_setup,
+            )
         except Exception as e:
+            restore()
             props.status_text = f"Pipeline failed: {e}"
             self.report({'ERROR'}, f"Pipeline failed: {e}")
             return {'CANCELLED'}
-        return {'FINISHED'} if ok else {'CANCELLED'}
+        return {'FINISHED'}
 
 
 class AHB_OT_RemoveAllUVMaps(Operator):
@@ -476,15 +559,16 @@ class AHB_OT_SaveImages(Operator):
         saved = 0
         failed = 0
 
-        for img in bpy.data.images:
-            if img.name.startswith(props.output_prefix) and img.has_data:
-                try:
-                    path = save_image(img, props, context)
-                    saved += 1
-                    self.report({'INFO'}, f"Saved: {path}")
-                except Exception as e:
-                    failed += 1
-                    self.report({'WARNING'}, f"Save failed [{img.name}]: {e}")
+        for img in list(owned_bake_images(props)):
+            if not img.has_data:
+                continue
+            try:
+                path = save_image(img, props, context)
+                saved += 1
+                self.report({'INFO'}, f"Saved: {path}")
+            except Exception as e:
+                failed += 1
+                self.report({'WARNING'}, f"Save failed [{img.name}]: {e}")
 
         self.report({'INFO'}, f"Saved {saved} image(s); failed: {failed}.")
         return {'FINISHED'} if saved and not failed else {'CANCELLED'}
@@ -503,7 +587,7 @@ class AHB_OT_RenewAutoSeams(Operator):
             self.report({'WARNING'}, "No valid mesh objects in scope.")
             return {'CANCELLED'}
 
-        count = clear_and_renew_auto_seams(obj_names, props)
+        count = clear_and_renew_auto_seams(obj_names, props, self.report)
         setup_atlas_uvs(obj_names, props)
 
         force_object_mode()
@@ -565,8 +649,11 @@ class AHB_OT_PreviewUV(Operator):
             tile_info = []
             for tile_idx, tile_obj_names in enumerate(tiles):
                 try:
+                    # No horizontal offset: every tile gets its own image
+                    # (bake_tile_01, bake_tile_02, ...), so shifting by
+                    # tile_idx would push UVs outside the image they bake into
+                    # and the preview would not match the bake.
                     setup_atlas_uvs(tile_obj_names, props)
-                    offset_tile_uvs(tile_obj_names, tile_idx, layer_name)
                     succeeded += 1
                     tile_info.append(
                         f"Tile {tile_idx + 1}: {len(tile_obj_names)} obj(s)")
@@ -588,12 +675,12 @@ class AHB_OT_PreviewUV(Operator):
             groups = get_atlas_groups(obj_names, props, self.report)
             succeeded = 0
             atlas_info = []
-            for atlas_idx, (atlas_number, atlas_obj_names) in enumerate(groups):
+            for atlas_number, atlas_obj_names in groups:
                 if not atlas_obj_names:
                     continue
                 try:
+                    # Each atlas has its own image, so no offset here either.
                     setup_atlas_uvs(atlas_obj_names, props)
-                    offset_tile_uvs(atlas_obj_names, atlas_idx, layer_name)
                     succeeded += 1
                     atlas_name = get_collection_atlas_name(props, atlas_number)
                     atlas_info.append(
@@ -751,15 +838,13 @@ class AHB_OT_CleanupImages(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        props   = context.scene.ahb_props
+        props = context.scene.ahb_props
         normalize_core_names(props)
-        prefix  = props.output_prefix
         removed = 0
 
-        for img in list(bpy.data.images):
-            if img.name.startswith(prefix):
-                bpy.data.images.remove(img)
-                removed += 1
+        for img in list(owned_bake_images(props)):
+            bpy.data.images.remove(img)
+            removed += 1
 
         self.report({'INFO'}, f"Removed {removed} bake image(s) from blend data.")
         return {'FINISHED'}
@@ -843,7 +928,7 @@ class AHB_OT_ToggleBakedView(Operator):
             return {'CANCELLED'}
 
         if scope_has_material_backups(obj_names):
-            restored = restore_material_backups(obj_names)
+            restored = restore_material_backups(obj_names, props)
             props.baked_view = False
             props.status_text = f"Showing original materials ({restored} restored)."
             self.report({'INFO'}, props.status_text)
@@ -889,6 +974,10 @@ class AHB_OT_GroupToCollections(Operator):
             self.report({'WARNING'}, "No valid mesh objects in scope.")
             return {'CANCELLED'}
 
+        self.report(
+            {'WARNING'},
+            "Objects move into the tile collections and leave their "
+            "current collections (Ctrl+Z undoes this).")
         moved = group_objects_by_tile(obj_names, props, self.report)
         return {'FINISHED'} if moved else {'CANCELLED'}
 
@@ -923,7 +1012,7 @@ class AHB_OT_RestoreOriginalMaterials(Operator):
             self.report({'WARNING'}, "No valid mesh objects in scope.")
             return {'CANCELLED'}
 
-        restored = restore_material_backups(obj_names)
+        restored = restore_material_backups(obj_names, props)
         props.baked_view = False
         self.report({'INFO'}, f"Restored {restored} material(s) to original.")
         return {'FINISHED'}

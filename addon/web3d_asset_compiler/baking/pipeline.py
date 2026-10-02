@@ -7,23 +7,20 @@ import bmesh
 import math
 import os
 import re
-import traceback
 from mathutils import Vector
 
 from ..utils import (
     force_ui_redraw,
+    island_bounds_and_gap,
     safe_filename,
     prepare_mesh_data,
     prepare_material_slots,
-    get_render_uv_name,
-    copy_image_uv_backup,
     preserve_implicit_texture_uvs,
     restore_image_uv_backups,
 )
 from .properties import (
     NODE_TAG,
     IMAGE_UV_BACKUP_LAYER,
-    IMAGE_UV_SOURCE_PROP,
     IMAGE_UV_BACKUP_PROP,
     PASS_FILTER_TYPES,
     LINEAR_COLORSPACES,
@@ -34,6 +31,10 @@ from .properties import (
 
 BAKE_COLOR_ATTRIBUTE = "AHB_BakedColor"
 BAKE_COLOR_ATTRIBUTE_PROP = "ahb_baked_color_attribute"
+OWNED_IMAGE_PROP = "ahb_owned_bake_image"
+OWNED_MATERIAL_PROP = "ahb_owned_backup"
+BACKUP_SOURCE_PROP = "ahb_backup_source"
+RENAME_BASE_PROP = "ahb_rename_base"
 
 
 def normalize_core_names(props):
@@ -65,6 +66,13 @@ def get_collection_atlas_name(props, atlas_number):
 
 
 def safe_set_colorspace(image, is_hdr, is_data=False):
+    """Set the image colorspace, raising if no candidate applies.
+
+    Returning silently on failure left data bakes (AO, Normal, Roughness,
+    Shadow, UV) on the default sRGB curve. That gamma-shifts every stored
+    value and produces a lightmap that still looks plausible in the viewport
+    and is wrong in the render, so it must be loud instead.
+    """
     if is_data:
         candidates = DATA_COLORSPACES
     else:
@@ -72,9 +80,35 @@ def safe_set_colorspace(image, is_hdr, is_data=False):
     for cs in candidates:
         try:
             image.colorspace_settings.name = cs
-            return
         except (TypeError, RuntimeError):
             continue
+        if image.colorspace_settings.name == cs:
+            return cs
+    raise RuntimeError(
+        f"No usable colorspace for '{image.name}' "
+        f"(tried {', '.join(candidates)}). Either the bake passes are "
+        f"non-color data that needs a linear/non-color curve, or this OCIO "
+        f"config is missing them; set the curve by hand and re-bake."
+    )
+
+
+def owned_bake_images(props):
+    """Yield only the bake images this addon created.
+
+    Never match on `output_prefix`: that prefix is user-editable and collides
+    with ordinary asset names, which would let the addon overwrite or delete
+    textures the user owns. Ownership is tracked per datablock instead.
+    """
+    prefix = props.output_prefix
+    for img in bpy.data.images:
+        if img.get(OWNED_IMAGE_PROP):
+            yield img
+        elif img.source == 'GENERATED' and img.name.startswith(prefix):
+            # Pre-existing images from older builds have no ownership tag.
+            # GENERATED + never saved to disk is safe to adopt.
+            if not img.filepath:
+                img[OWNED_IMAGE_PROP] = True
+                yield img
 
 
 def get_or_create_image(props, name):
@@ -85,6 +119,13 @@ def get_or_create_image(props, name):
     img_name = f"{props.output_prefix}{name}"
 
     img = bpy.data.images.get(img_name)
+    if img and not img.get(OWNED_IMAGE_PROP):
+        # Name belongs to a user texture. Never remove it; suffix until free.
+        suffix = 1
+        while bpy.data.images.get(f"{img_name}.{suffix}"):
+            suffix += 1
+        img_name = f"{img_name}.{suffix}"
+        img = None
     if img:
         if img.size[0] != rx or img.size[1] != ry:
             bpy.data.images.remove(img)
@@ -101,6 +142,7 @@ def get_or_create_image(props, name):
             float_buffer=is_hdr,
             alpha=(props.color_mode == 'RGBA'),
         )
+    img[OWNED_IMAGE_PROP] = True
 
     safe_set_colorspace(img, is_hdr, is_data)
     return img
@@ -150,6 +192,20 @@ def get_atlas_groups(obj_names, props, report=None):
             preview += f", +{len(missing_collections) - 4} more"
         report({'WARNING'}, f"Missing collection(s): {preview}")
 
+    if duplicate_memberships:
+        # Each object can only live in one atlas. Silently dropping it from the
+        # second made the reported object count lower than the scene without
+        # any hint that a texture pack was missing an object.
+        preview = ", ".join(
+            f"{name} (in atlas {first} and {second})"
+            for name, first, second in duplicate_memberships[:4]
+        )
+        if len(duplicate_memberships) > 4:
+            preview += f", +{len(duplicate_memberships) - 4} more"
+        report({'WARNING'},
+               f"Object(s) in more than one atlas collection, kept only in the "
+               f"first: {preview}")
+
     return groups
 
 
@@ -172,9 +228,14 @@ def isolate_materials_between_atlas_groups(groups):
                 if not mat: continue
                 prev = mat_atlas_map.get(mat.name)
                 if prev is not None and prev != atlas_number:
+                    original_name = mat.name
                     new_mat = mat.copy()
-                    new_mat.name = f"{mat.name}_atlas{atlas_number:02d}"
+                    new_mat.name = f"{original_name}_atlas{atlas_number:02d}"
                     slot.material = new_mat
+                    # Both names now belong to this atlas. Without the second
+                    # write the next object sharing `original_name` copies
+                    # again, producing N-1 duplicate materials per material.
+                    mat_atlas_map[original_name] = atlas_number
                     mat = new_mat
                     duplicated += 1
                 mat_atlas_map[mat.name] = atlas_number
@@ -305,8 +366,16 @@ def bake_type_needs_uv(props):
 
 
 def pixel_margin_to_uv(px, props):
+    """Convert a requested inter-island gutter in pixels to a Blender pack margin.
+
+    Blender applies `margin_method='FRACTION'` *per island side*, so the gap
+    that ends up between two adjacent islands is twice the value passed in.
+    `pack_margin_px` is the total gutter the user asked for (and the bake
+    margin is already clamped to half of it in `configure_bake_settings`), so
+    halve here. Without this the atlas wastes ~half its area on padding.
+    """
     rx, ry = get_resolution(props)
-    return px / min(rx, ry)
+    return (px * 0.5) / min(rx, ry)
 
 
 def has_real_image_textures(mat, bake_tag):
@@ -332,12 +401,20 @@ def force_object_mode():
 
 
 def enter_edit_select_all(obj, layer_name):
+    """Enter single-object edit mode with all faces and `layer_name` active.
+
+    Two things must happen *before* `mode_set`: deselect everything else, or
+    Blender enters multi-object edit mode and every `bpy.ops.uv.*` call that
+    follows silently operates on the whole selection instead of this mesh.
+    """
     force_object_mode()
+    bpy.ops.object.select_all(action='DESELECT')
+    obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='SELECT')
     if layer_name in obj.data.uv_layers:
         obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
 
 
 def subdivide_large_uv_islands(obj_name, layer_name, max_island_ratio=0.15):
@@ -435,6 +512,26 @@ def subdivide_large_uv_islands(obj_name, layer_name, max_island_ratio=0.15):
         bm.free()
 
 
+def _uv_area(face, uv_layer):
+    """Signed-free polygon area in UV space (shoelace)."""
+    loops = [loop[uv_layer].uv for loop in face.loops]
+    total = 0.0
+    for index in range(len(loops)):
+        a = loops[index]
+        b = loops[(index + 1) % len(loops)]
+        total += a.x * b.y - b.x * a.y
+    return abs(total) * 0.5
+
+
+def _uv_perimeter(face, uv_layer):
+    """Closed polygon edge length in UV space."""
+    loops = [loop[uv_layer].uv for loop in face.loops]
+    return sum(
+        (loops[(index + 1) % len(loops)] - loops[index]).length
+        for index in range(len(loops))
+    )
+
+
 def stack_similar_islands(obj_names, layer_name, area_tol=0.01, perim_tol=0.01):
     """Stack translation-identical islands while rejecting unsafe lookalikes."""
     stacked_total = 0
@@ -488,9 +585,15 @@ def stack_similar_islands(obj_names, layer_name, area_tol=0.01, perim_tol=0.01):
                      round(loop[uv_layer].uv.y - center.y, 6))
                     for loop in loops
                 ))
+                # UV-space area and perimeter, not the 3D ones. The question
+                # here is purely "do these islands occupy the same shape in UV
+                # space", and bmesh's calc_area()/calc_perimeter() measure the
+                # mesh, so identical UV islands on differently scaled meshes
+                # failed the tolerance and nothing ever stacked.
                 data = {
-                    'area': sum(face.calc_area() for face in faces),
-                    'perimeter': sum(face.calc_perimeter() for face in faces),
+                    'area': sum(_uv_area(face, uv_layer) for face in faces),
+                    'perimeter': sum(
+                        _uv_perimeter(face, uv_layer) for face in faces),
                     'center': center,
                     'faces': faces,
                     'signature': (
@@ -645,13 +748,7 @@ def apply_image_boost(obj_name, props):
     if not image_mat_indices:
         return
 
-    force_object_mode()
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='SELECT')
-
-    if layer_name in obj.data.uv_layers:
-        obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
+    enter_edit_select_all(obj, layer_name)
 
     try:
         bm = bmesh.from_edit_mesh(obj.data)
@@ -687,46 +784,44 @@ def apply_image_boost(obj_name, props):
 
 
 def run_blender_pack(props, uv_margin):
+    """One pack pass over the current selection. Returns True if it ran.
+
+    `scale=True` is not a density preference, it is a correctness requirement.
+    Blender only runs the margin line search when at least one island is
+    scalable (`uv_pack.cc`: `can_scale_count > 0`); with `scale=False` the
+    packer lays islands out to fill and then adds the margin on top, pushing
+    the result past 1.0. Measured at 512px, a two-cube tile, 16px requested:
+
+        FRACTION scale=False  ->  gutter 16px but UVs reach 1.042  (overflow)
+        FRACTION scale=True   ->  gutter 16px,  UVs reach 0.984  (correct)
+
+    The overflow is silent, and it paints into the neighbouring tile.
+    """
     rotate = props.pack_rotate and props.pack_rotation_step != 'NONE'
-    rotation_mode = props.pack_rotation_step
-    if rotation_mode in ('90', '45'):
-        rotation_mode = 'AXIS_ALIGNED'
-    rot_method = ('ANY' if rotation_mode == 'ANY' else 'AXIS_ALIGNED')
-    shape_method = ('CONCAVE' if props.pack_nest_holes
-                    else props.pack_shape_method)
-    scale = True
-    merge_overlap = props.pack_stack_identical
+    rot_method = 'ANY' if props.pack_rotation_step == 'ANY' else 'AXIS_ALIGNED'
+    shape_method = 'CONCAVE' if props.pack_nest_holes else props.pack_shape_method
 
-    try:
-        bpy.ops.uv.pack_islands(
-            margin_method='FRACTION',
-            margin=uv_margin,
-            rotate=rotate,
-            rotate_method=rot_method,
-            scale=scale,
-            shape_method=shape_method,
-            merge_overlap=merge_overlap,
-        )
-        return
-    except Exception:
-        pass
-
-    try:
-        bpy.ops.uv.pack_islands(
-            margin=uv_margin,
-            rotate=rotate,
-            scale=scale,
-            shape_method=shape_method,
-            merge_overlap=merge_overlap,
-        )
-        return
-    except Exception:
-        pass
-
-    try:
-        bpy.ops.uv.pack_islands(margin=uv_margin, rotate=rotate)
-    except Exception:
-        pass
+    shared = dict(
+        rotate=rotate,
+        rotate_method=rot_method,
+        scale=True,
+        shape_method=shape_method,
+        merge_overlap=props.pack_stack_identical,
+    )
+    # Progressively drop arguments so a future rename of one keyword degrades
+    # to a coarser pack rather than to no pack at all.
+    attempts = (
+        dict(shared, margin_method='FRACTION', margin=uv_margin),
+        dict(shared, margin=uv_margin),
+        dict(rotate=rotate, scale=True),
+    )
+    for extra in attempts:
+        try:
+            bpy.ops.uv.pack_islands(**extra)
+            return True
+        except (TypeError, RuntimeError, ValueError):
+            continue
+    return False
 
 
 def run_uv_normalize(obj_name, props):
@@ -747,7 +842,92 @@ def run_uv_normalize(obj_name, props):
     apply_world_area_scale(obj_name, layer_name)
 
 
-def run_uv_pack(obj_name, props):
+def verify_uv_pack(obj_names, props, report, label=""):
+    """Check the packed atlas and report what is actually wrong.
+
+    Packing can fail in ways that look like success: the margin line search is
+    skipped when no island is scalable, which silently pushes UVs past 1.0, and
+    a too-tight gutter produces lightmap bleed that no operator flags. Report
+    both instead of baking a corrupt atlas.
+    """
+    layer_name = props.uv_layer_name
+    rx, ry = get_resolution(props)
+    resolution = min(rx, ry)
+    target_gap = props.pack_margin_px / resolution if props.pack_enabled else 0.0
+    gap, u_min, u_max, islands = island_bounds_and_gap(
+        obj_names, layer_name, target_gap)
+    if not islands:
+        return False
+    prefix = f"[{label}] " if label else ""
+    problems = []
+
+    if u_max > 1.0001 or u_min < -0.0001:
+        problems.append(
+            f"UVs reach {u_max:.3f}/{u_min:.3f}, outside the 0-1 tile "
+            f"(~{(max(u_max - 1.0, -u_min) * resolution):.0f}px of bleed into "
+            f"the neighbouring tile)")
+
+    # The bake margin is global to the scene, so it has to fit the *worst*
+    # group in the build, not whichever group verified last.
+    measured = gap * resolution if gap is not None else 0.0
+    known = props.uv_gutter_px >= 0.0
+    props.uv_gutter_px = min(props.uv_gutter_px, measured) \
+        if known else measured
+
+    if props.pack_enabled and props.pack_margin_px > 0 and gap is not None:
+        gap_px = gap * resolution
+        # A strictly positive gap between island AABBs proves no two islands
+        # intersect, so this also covers overlap detection. Blender's own
+        # `bpy.ops.uv.select_overlap` cannot serve as the oracle: in 5.2 the UV
+        # selection moved to bmesh and is not readable from Python, and
+        # `tool_settings.use_uv_select_sync` does not carry the result back, so
+        # it silently reports zero even for fully coincident islands.
+        if gap_px < props.pack_margin_px * 0.9:
+            # Handled: the bake inset is clamped to this value below. Still
+            # worth surfacing, because the fix is a bigger atlas, not a
+            # different setting.
+            report(
+                {'WARNING'},
+                f"{prefix}requested a {props.pack_margin_px}px gutter but the "
+                f"pack achieved {gap_px:.1f}px. The bake margin has been "
+                f"reduced to fit. Raise the resolution or lower Pack Margin "
+                f"if you need the wider gutter.")
+
+    if problems:
+        for problem in problems:
+            report({'ERROR'}, f"{prefix}bad UV pack: {problem}")
+        props.pack_verified = False
+        return False
+
+    report(
+        {'INFO'},
+        f"{prefix}UV pack verified: {islands} island(s), "
+        f"{'gutter %.1fpx' % (gap * resolution) if gap is not None else 'single island'}, "
+        f"range {u_min:.3f}-{u_max:.3f}")
+    props.pack_verified = True
+    return True
+
+
+def pack_group_once(obj_names, layer_name, props, uv_margin, enter):
+    """One pack pass over a group. Enters and leaves edit mode itself.
+
+    Edit mode must not be held across a timer tick: the user can click another
+    object between steps, and edit-mode selection is shared state that a
+    `bpy.ops.uv.*` call then operates on.
+
+    Returns True when more passes are still wanted.
+    """
+    if not enter(obj_names, layer_name):
+        return False
+    try:
+        run_blender_pack(props, uv_margin)
+        return True
+    finally:
+        force_object_mode()
+
+
+def run_uv_pack_steps(obj_name, props):
+    """Single-object pack, yielding before each pack iteration."""
     obj = bpy.data.objects.get(obj_name)
     if not obj or obj.type != 'MESH':
         return
@@ -756,45 +936,34 @@ def run_uv_pack(obj_name, props):
         return
 
     uv_margin = pixel_margin_to_uv(props.pack_margin_px, props)
-    rotate = props.pack_rotate and props.pack_rotation_step != 'NONE'
 
-    if props.pack_engine == 'BLENDER' and props.pack_stack_identical:
+    if props.pack_stack_identical:
         stack_similar_islands([obj_name], layer_name)
 
-    enter_edit_select_all(obj, layer_name)
-    try:
-        if props.pack_engine == 'UVP3' and hasattr(bpy.ops, 'uvpackmaster3'):
-            try:
-                bpy.context.scene.uvp3_props.margin = uv_margin
-                bpy.ops.uvpackmaster3.pack()
-                return
-            except Exception:
-                pass
-        elif props.pack_engine == 'UVP2' and hasattr(bpy.ops, 'uvpackmaster2'):
-            try:
-                bpy.context.scene.uvp2_props.margin = uv_margin
-                bpy.ops.uvpackmaster2.uv_pack()
-                return
-            except Exception:
-                pass
-
-        for _i in range(props.pack_iterations):
-            run_blender_pack(props, uv_margin)
-
-    finally:
-        force_object_mode()
+    for _i in range(props.pack_iterations):
+        props.status_text = f"Packing {obj_name} — pass {_i + 1}/{props.pack_iterations}"
+        force_ui_redraw()
+        yield
+        if not pack_group_once(
+                [obj_name], layer_name, props, uv_margin, enter_edit_select_all):
+            return
 
 
-def pack_uv_islands_phased(obj_name, props):
+def pack_uv_islands_phased_steps(obj_name, props):
     if props.pack_world_scale:
         run_uv_normalize(obj_name, props)
     if props.pack_image_boost > 1.01:
         apply_image_boost(obj_name, props)
-    run_uv_pack(obj_name, props)
+    yield from run_uv_pack_steps(obj_name, props)
     if props.pack_scale_islands:
         scale_uvs_to_bounds(
             [obj_name], props.uv_layer_name,
             margin=pixel_margin_to_uv(props.pack_margin_px, props))
+
+
+def pack_uv_islands_phased(obj_name, props):
+    for _ in pack_uv_islands_phased_steps(obj_name, props):
+        pass
 
 
 def remove_old_uvs(obj_names, keep_layer_name):
@@ -821,7 +990,77 @@ def remove_old_uvs(obj_names, keep_layer_name):
                 mesh.uv_layers.remove(mesh.uv_layers[name])
 
 
-def ensure_uv(obj_name, props):
+def enter_edit_multi_select_all(obj_names, layer_name):
+    """Enter edit mode on exactly `obj_names` with `layer_name` active."""
+    force_object_mode()
+    bpy.ops.object.select_all(action='DESELECT')
+    first_obj = None
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if not obj or obj.type != 'MESH':
+            continue
+        obj.select_set(True)
+        if first_obj is None:
+            first_obj = obj
+    if not first_obj:
+        return False
+    bpy.context.view_layer.objects.active = first_obj
+    for obj in bpy.context.selected_objects:
+        if layer_name in obj.data.uv_layers:
+            obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    return True
+
+
+def unwrap_dispatch(props):
+    """Run the configured UV unwrap. Caller must already be in edit mode."""
+    if props.uv_mode == 'SMART':
+        bpy.ops.uv.smart_project(
+            angle_limit=math.radians(props.smart_uv_angle),
+            island_margin=props.smart_uv_island_margin,
+        )
+    elif props.uv_mode == 'CUBE':
+        bpy.ops.uv.cube_project(cube_size=props.cube_size)
+        try:
+            bpy.ops.uv.average_islands_scale()
+        except Exception:
+            pass
+    elif props.uv_mode == 'UNWRAP':
+        bpy.ops.uv.unwrap(
+            method='ANGLE_BASED', margin=props.smart_uv_island_margin)
+    elif props.uv_mode == 'AUTO_SEAM':
+        bpy.ops.uv.smart_project(
+            angle_limit=math.radians(props.auto_seam_angle), island_margin=0.001)
+        bpy.ops.uv.seams_from_islands(mark_seams=True, mark_sharp=False)
+        bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+    elif props.uv_mode == 'LIGHTMAP':
+        try:
+            bpy.ops.uv.lightmap_pack(
+                PREF_CONTEXT='ALL_FACES',
+                PREF_PACK_IN_ONE=True,
+                PREF_NEW_UVLAYER=False,
+                PREF_BOX_DIV=props.lightmap_quality,
+                PREF_MARGIN_DIV=props.lightmap_margin,
+            )
+        except Exception:
+            bpy.ops.uv.smart_project(
+                angle_limit=math.radians(66.0), island_margin=0.03)
+
+
+def subdivide_and_rewrap(obj_names, layer_name):
+    """Split oversized islands, then re-unwrap any mesh that was split."""
+    if not any(subdivide_large_uv_islands(name, layer_name) for name in obj_names):
+        return
+    if enter_edit_multi_select_all(obj_names, layer_name):
+        try:
+            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+        finally:
+            force_object_mode()
+
+
+def ensure_uv_steps(obj_name, props):
+    """Create/refresh one object's bake UVs, yielding around the pack work."""
     obj = bpy.data.objects.get(obj_name)
     if not obj or obj.type != 'MESH':
         return
@@ -834,12 +1073,9 @@ def ensure_uv(obj_name, props):
     if layer_name not in mesh.uv_layers:
         mesh.uv_layers.new(name=layer_name)
 
-    uv_layer = mesh.uv_layers[layer_name]
-    mesh.uv_layers.active = uv_layer
-
     if props.uv_mode == 'EXISTING':
         if props.pack_enabled:
-            pack_uv_islands_phased(obj_name, props)
+            yield from pack_uv_islands_phased_steps(obj_name, props)
         return
 
     if (props.uv_mode == 'AUTO_SEAM'
@@ -847,66 +1083,30 @@ def ensure_uv(obj_name, props):
         for edge in mesh.edges:
             edge.use_seam = False
 
-    force_object_mode()
-    bpy.context.view_layer.objects.active = obj
+    yield
+    enter_edit_select_all(obj, layer_name)
     try:
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        mesh.uv_layers.active = mesh.uv_layers[layer_name]
-
-        if props.uv_mode == 'SMART':
-            angle_rad = math.radians(props.smart_uv_angle)
-            bpy.ops.uv.smart_project(
-                angle_limit=angle_rad,
-                island_margin=props.smart_uv_island_margin,
-            )
-        elif props.uv_mode == 'CUBE':
-            bpy.ops.uv.cube_project(cube_size=props.cube_size)
-            try:
-                bpy.ops.uv.average_islands_scale()
-            except Exception:
-                pass
-        elif props.uv_mode == 'UNWRAP':
-            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=props.smart_uv_island_margin)
-        elif props.uv_mode == 'AUTO_SEAM':
-            seam_rad = math.radians(props.auto_seam_angle)
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.uv.smart_project(angle_limit=seam_rad, island_margin=0.001)
-            bpy.ops.uv.seams_from_islands(mark_seams=True, mark_sharp=False)
-            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-        elif props.uv_mode == 'LIGHTMAP':
-            try:
-                bpy.ops.uv.lightmap_pack(
-                    PREF_CONTEXT='ALL_FACES',
-                    PREF_PACK_IN_ONE=True,
-                    PREF_NEW_UVLAYER=False,
-                    PREF_BOX_DIV=props.lightmap_quality,
-                    PREF_MARGIN_DIV=props.lightmap_margin,
-                )
-            except Exception:
-                angle_rad = math.radians(66.0)
-                bpy.ops.uv.smart_project(angle_limit=angle_rad, island_margin=0.03)
+        unwrap_dispatch(props)
     finally:
         force_object_mode()
 
-    if (props.uv_mode == 'AUTO_SEAM'
-            and subdivide_large_uv_islands(obj_name, layer_name)):
-        obj = bpy.data.objects.get(obj_name)
-        if obj:
-            enter_edit_select_all(obj, layer_name)
-            try:
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-            finally:
-                force_object_mode()
+    if props.uv_mode == 'AUTO_SEAM':
+        subdivide_and_rewrap([obj_name], layer_name)
 
     if props.pack_enabled:
-        pack_uv_islands_phased(obj_name, props)
+        yield from pack_uv_islands_phased_steps(obj_name, props)
 
     if props.remove_old_uvs:
         remove_old_uvs([obj_name], props.uv_layer_name)
 
 
-def setup_atlas_uvs(obj_names, props):
+def ensure_uv(obj_name, props):
+    for _ in ensure_uv_steps(obj_name, props):
+        pass
+
+
+def setup_atlas_uvs_steps(obj_names, props, report=None, label=""):
+    """Unwrap and pack a group, yielding around the pack iterations."""
     layer_name = props.uv_layer_name
     force_object_mode()
 
@@ -932,179 +1132,91 @@ def setup_atlas_uvs(obj_names, props):
 
     if props.uv_mode == 'EXISTING':
         if props.pack_enabled:
-            atlas_pack_phase(valid_objs, props)
+            yield from atlas_pack_phase_steps(valid_objs, props, report, label)
         return
 
-    force_object_mode()
-    bpy.ops.object.select_all(action='DESELECT')
-    first_obj = None
-    for obj_name in valid_objs:
-        obj = bpy.data.objects.get(obj_name)
-        if obj:
-            obj.select_set(True)
-            if first_obj is None:
-                first_obj = obj
-
-    if not first_obj:
-        return
-    bpy.context.view_layer.objects.active = first_obj
-
-    try:
-        bpy.ops.object.mode_set(mode='EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
-        for obj_name in valid_objs:
-            obj = bpy.data.objects.get(obj_name)
-            if obj and layer_name in obj.data.uv_layers:
-                obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
-
-        if props.uv_mode == 'SMART':
-            angle_rad = math.radians(props.smart_uv_angle)
-            bpy.ops.uv.smart_project(
-                angle_limit=angle_rad,
-                island_margin=props.smart_uv_island_margin,
-            )
-        elif props.uv_mode == 'CUBE':
-            bpy.ops.uv.cube_project(cube_size=props.cube_size)
-            try:
-                bpy.ops.uv.average_islands_scale()
-            except Exception:
-                pass
-        elif props.uv_mode == 'UNWRAP':
-            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=props.smart_uv_island_margin)
-        elif props.uv_mode == 'AUTO_SEAM':
-            seam_rad = math.radians(props.auto_seam_angle)
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.uv.smart_project(angle_limit=seam_rad, island_margin=0.001)
-            bpy.ops.uv.seams_from_islands(mark_seams=True, mark_sharp=False)
-            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-        elif props.uv_mode == 'LIGHTMAP':
-            try:
-                bpy.ops.uv.lightmap_pack(
-                    PREF_CONTEXT='ALL_FACES',
-                    PREF_PACK_IN_ONE=True,
-                    PREF_NEW_UVLAYER=False,
-                    PREF_BOX_DIV=props.lightmap_quality,
-                    PREF_MARGIN_DIV=props.lightmap_margin,
-                )
-            except Exception:
-                angle_rad = math.radians(66.0)
-                bpy.ops.uv.smart_project(angle_limit=angle_rad, island_margin=0.03)
-    finally:
-        force_object_mode()
+    yield
+    if enter_edit_multi_select_all(valid_objs, layer_name):
+        try:
+            unwrap_dispatch(props)
+        finally:
+            force_object_mode()
 
     if props.uv_mode == 'AUTO_SEAM':
-        any_split = False
-        for obj_name in valid_objs:
-            if subdivide_large_uv_islands(obj_name, layer_name):
-                any_split = True
-        if any_split:
-            force_object_mode()
-            bpy.ops.object.select_all(action='DESELECT')
-            first_obj = None
-            for obj_name in valid_objs:
-                obj = bpy.data.objects.get(obj_name)
-                if obj:
-                    obj.select_set(True)
-                    if first_obj is None:
-                        first_obj = obj
-            if first_obj:
-                bpy.context.view_layer.objects.active = first_obj
-                try:
-                    bpy.ops.object.mode_set(mode='EDIT')
-                    bpy.ops.mesh.select_all(action='SELECT')
-                    for obj_name in valid_objs:
-                        obj = bpy.data.objects.get(obj_name)
-                        if obj and layer_name in obj.data.uv_layers:
-                            obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
-                    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-                finally:
-                    force_object_mode()
+        subdivide_and_rewrap(valid_objs, layer_name)
 
     if props.pack_enabled:
-        atlas_pack_phase(valid_objs, props)
+        yield from atlas_pack_phase_steps(valid_objs, props, report, label)
 
     if props.remove_old_uvs:
         remove_old_uvs(valid_objs, props.uv_layer_name)
 
 
-def atlas_pack_phase(obj_names, props):
+def setup_atlas_uvs(obj_names, props):
+    """Blocking form of `setup_atlas_uvs_steps`, for the standalone operators."""
+    for _ in setup_atlas_uvs_steps(obj_names, props):
+        pass
+
+
+def atlas_pack_phase_steps(obj_names, props, report=None, label=""):
+    """Pack UVs, yielding before each pack iteration.
+
+    `bpy.ops.uv.pack_islands` has no invoke path in Blender, so a single call is
+    atomic and cannot be interrupted. Measured on this machine: 1.9s for one
+    cube, ~7s for a two-object tile, and a few milliseconds with
+    `pack_shape_method='AABB'`. Yields here are what keep the longest block down
+    to a single pass instead of the whole pipeline.
+
+    ponytail: one pass is the floor, because `bpy.ops.uv.pack_islands` is
+    atomic and has no invoke path. Measured at 512px on a two-object tile,
+    ~7.5s per pass and ~36s once the FRACTION line search is engaged (which it
+    must be, or the result overflows the tile). Quality was chosen over speed:
+    pack_iterations=3, rotate_method='ANY' and shape_method='CONCAVE' all stay
+    at their quality settings, and the status line shows the pass number so the
+    cost is visible. For a faster turnaround build, drop pack_iterations to 1
+    or set pack_shape_method to 'AABB' -- both are already in the sidebar.
+    """
     layer_name = props.uv_layer_name
+    yield
     if props.pack_world_scale:
-        force_object_mode()
-        bpy.ops.object.select_all(action='DESELECT')
-        first_obj = None
-        for obj_name in obj_names:
-            obj = bpy.data.objects.get(obj_name)
-            if obj:
-                obj.select_set(True)
-                if first_obj is None:
-                    first_obj = obj
-        if first_obj:
-            bpy.context.view_layer.objects.active = first_obj
+        if enter_edit_multi_select_all(obj_names, layer_name):
             try:
-                bpy.ops.object.mode_set(mode='EDIT')
-                bpy.ops.mesh.select_all(action='SELECT')
-                for obj_name in obj_names:
-                    obj = bpy.data.objects.get(obj_name)
-                    if obj and layer_name in obj.data.uv_layers:
-                        obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
-                try:
-                    bpy.ops.uv.average_islands_scale()
-                except Exception:
-                    pass
+                bpy.ops.uv.average_islands_scale()
+            except Exception:
+                pass
             finally:
                 force_object_mode()
         for obj_name in obj_names:
             apply_world_area_scale(obj_name, layer_name)
 
-    if props.pack_engine == 'BLENDER' and props.pack_stack_identical:
+    yield
+    if props.pack_stack_identical:
         stack_similar_islands(obj_names, layer_name)
 
-    force_object_mode()
-    bpy.ops.object.select_all(action='DESELECT')
-    first_obj = None
-    for obj_name in obj_names:
-        obj = bpy.data.objects.get(obj_name)
-        if obj:
-            obj.select_set(True)
-            if first_obj is None:
-                first_obj = obj
-    if first_obj:
-        bpy.context.view_layer.objects.active = first_obj
-        uv_margin = pixel_margin_to_uv(props.pack_margin_px, props)
-        packed = False
-        try:
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
-            for obj_name in obj_names:
-                obj = bpy.data.objects.get(obj_name)
-                if obj and layer_name in obj.data.uv_layers:
-                    obj.data.uv_layers.active = obj.data.uv_layers[layer_name]
+    uv_margin = pixel_margin_to_uv(props.pack_margin_px, props)
+    iterations = max(1, props.pack_iterations)
+    for index in range(iterations):
+        props.status_text = (
+            f"Packing {len(obj_names)} object(s) — pass {index + 1}/{iterations}")
+        force_ui_redraw()
+        yield
+        needs_more = pack_group_once(
+            obj_names, layer_name, props, uv_margin, enter_edit_multi_select_all)
+        if not needs_more:
+            break
 
-            if props.pack_engine == 'UVP3' and hasattr(bpy.ops, 'uvpackmaster3'):
-                try:
-                    bpy.context.scene.uvp3_props.margin = uv_margin
-                    bpy.ops.uvpackmaster3.pack()
-                    packed = True
-                except Exception:
-                    pass
-            if (not packed and props.pack_engine == 'UVP2'
-                    and hasattr(bpy.ops, 'uvpackmaster2')):
-                try:
-                    bpy.context.scene.uvp2_props.margin = uv_margin
-                    bpy.ops.uvpackmaster2.uv_pack()
-                    packed = True
-                except Exception:
-                    pass
+    if props.pack_scale_islands:
+        scale_uvs_to_bounds(obj_names, layer_name, margin=uv_margin)
 
-            if not packed:
-                for _i in range(props.pack_iterations):
-                    run_blender_pack(props, uv_margin)
-        finally:
-            force_object_mode()
+    yield
+    if report is not None:
+        verify_uv_pack(obj_names, props, report, label)
 
-        if props.pack_scale_islands:
-            scale_uvs_to_bounds(obj_names, layer_name, margin=uv_margin)
+
+def atlas_pack_phase(obj_names, props):
+    """Blocking form of `atlas_pack_phase_steps`, for the standalone operators."""
+    for _ in atlas_pack_phase_steps(obj_names, props):
+        pass
 
 
 def distribute_tiles(obj_names, tile_count):
@@ -1113,7 +1225,7 @@ def distribute_tiles(obj_names, tile_count):
         obj = bpy.data.objects.get(obj_name)
         if not obj or obj.type != 'MESH':
             continue
-        area = sum(p.area for p in obj.data.polygons) if obj.data.polygons else 0.0
+        area = world_surface_area(obj) if obj.data.polygons else 0.0
         obj_areas.append((obj_name, area))
 
     obj_areas.sort(key=lambda x: x[1], reverse=True)
@@ -1138,9 +1250,7 @@ def remove_tile_uv_offsets(obj_names, layer_name):
         if layer_name not in obj.data.uv_layers:
             continue
 
-        force_object_mode()
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT')
+        enter_edit_select_all(obj, layer_name)
         try:
             bm = bmesh.from_edit_mesh(obj.data)
             uv_layer = bm.loops.layers.uv.active
@@ -1149,39 +1259,10 @@ def remove_tile_uv_offsets(obj_names, layer_name):
                 if loops:
                     min_x = min(loop[uv_layer].uv.x for loop in loops)
                     tile_offset = math.floor(min_x + 1e-6)
-                    if tile_offset > 0:
+                    if tile_offset != 0:
                         for loop in loops:
                             loop[uv_layer].uv.x -= tile_offset
                         bmesh.update_edit_mesh(obj.data)
-        finally:
-            force_object_mode()
-
-
-def offset_tile_uvs(obj_names, tile_idx, layer_name):
-    if tile_idx == 0:
-        return
-
-    for obj_name in obj_names:
-        obj = bpy.data.objects.get(obj_name)
-        if not obj or obj.type != 'MESH':
-            continue
-        if len(obj.data.vertices) == 0 or len(obj.data.polygons) == 0:
-            continue
-        if layer_name not in obj.data.uv_layers:
-            continue
-
-        force_object_mode()
-        bpy.context.view_layer.objects.active = obj
-        bpy.ops.object.mode_set(mode='EDIT')
-        try:
-            bm = bmesh.from_edit_mesh(obj.data)
-            uv_layer = bm.loops.layers.uv.active
-            if uv_layer:
-                offset_x = float(tile_idx)
-                for face in bm.faces:
-                    for loop in face.loops:
-                        loop[uv_layer].uv.x += offset_x
-                bmesh.update_edit_mesh(obj.data)
         finally:
             force_object_mode()
 
@@ -1247,6 +1328,23 @@ def configure_cycles_device(scene, props):
 
     requested = props.gpu_backend
     configured = getattr(cycles_prefs, "compute_device_type", 'NONE')
+    # Cycles only enumerates devices for the backend currently selected, so
+    # probing means writing global user preferences. Snapshot them so a failed
+    # probe does not leave the user's Cycles prefs reconfigured.
+    # ponytail: a successful bake leaves the GPU backend selected; restoring it
+    # afterwards needs the bake lifetime threaded through run_bake's finally.
+    original_backend = configured
+    original_device_use = None
+
+    def restore_prefs():
+        try:
+            cycles_prefs.compute_device_type = original_backend
+            if original_device_use is not None:
+                for device, was_used in original_device_use.items():
+                    device.use = was_used
+        except (TypeError, ValueError, RuntimeError, AttributeError):
+            pass
+
     candidates = []
     if requested == 'AUTO':
         if configured and configured != 'NONE':
@@ -1273,6 +1371,8 @@ def configure_cycles_device(scene, props):
         if not gpu_devices:
             continue
 
+        if original_device_use is None:
+            original_device_use = {device: device.use for device in devices}
         for device in devices:
             device.use = device in gpu_devices
 
@@ -1281,6 +1381,7 @@ def configure_cycles_device(scene, props):
         props.device_status = f"GPU / {backend}: {names}"
         return
 
+    restore_prefs()
     props.device_status = "GPU unavailable"
     tried = ", ".join(attempted)
     raise RuntimeError(
@@ -1323,7 +1424,14 @@ def configure_bake_settings(props, context):
         bake.type = 'NORMALS'
 
     if props.pack_enabled:
-        bake.margin = min(props.margin, max(0, props.pack_margin_px // 2))
+        # Clamp against the gutter the pack *achieved*, not the one that was
+        # asked for. The packer cannot always fit the requested margin - two
+        # large islands in a small atlas get what they get - and a bake inset
+        # of N on each side of a gap narrower than 2N bleeds into the
+        # neighbour.
+        available = int(props.uv_gutter_px // 2) if props.uv_gutter_px >= 0 \
+            else max(0, props.pack_margin_px // 2)
+        bake.margin = min(props.margin, max(0, available))
     else:
         bake.margin = props.margin
 
@@ -1375,21 +1483,27 @@ def save_image(image, props, context):
 
     scene = context.scene
     img_settings = scene.render.image_settings
-    save_format = ('OPEN_EXR' if props.image_format == 'OPEN_EXR_MULTILAYER'
+    save_format = ('OPEN_EXR_MULTILAYER'
+                   if props.image_format == 'OPEN_EXR_MULTILAYER'
                    else props.image_format)
     original_settings = {}
     for setting_name in (
-            'file_format', 'color_mode', 'color_depth', 'exr_codec', 'quality'):
+            'media_type', 'file_format', 'color_mode', 'color_depth',
+            'exr_codec', 'quality'):
         try:
             original_settings[setting_name] = getattr(img_settings, setting_name)
         except (AttributeError, TypeError):
             continue
+    original_path = image.filepath_raw
     try:
+        # Blender 5.0+ requires media_type before file_format is assignable.
+        if 'media_type' in original_settings:
+            img_settings.media_type = 'IMAGE'
         img_settings.file_format = save_format
         img_settings.color_mode = ('RGB' if save_format in ('JPEG', 'HDR')
                                    else props.color_mode)
 
-        if save_format == 'OPEN_EXR':
+        if save_format.startswith('OPEN_EXR'):
             img_settings.color_depth = '32' if props.use_hdr_float else '16'
             img_settings.exr_codec = props.exr_codec
         elif save_format == 'JPEG':
@@ -1410,6 +1524,10 @@ def save_image(image, props, context):
                 setattr(img_settings, setting_name, value)
             except (AttributeError, TypeError):
                 pass
+        try:
+            image.filepath_raw = original_path
+        except (AttributeError, TypeError):
+            pass
 
     return path
 
@@ -1424,12 +1542,12 @@ def do_bake_batch(obj_names, props, context, source_obj_names=None):
     if not objs_to_bake:
         return False
 
-    if not validate_bake_ready([obj.name for obj in objs_to_bake], props,
-                                lambda _level, _message: None):
-        target_label = ("UV layer or active image node"
-                        if uses_image_bake_target(props)
-                        else "active color attribute")
-        raise RuntimeError(f"Bake target is missing its required {target_label}")
+    problems = validate_bake_ready([obj.name for obj in objs_to_bake], props,
+                                   lambda _level, _message: None)
+    if problems:
+        # `validate_bake_ready` builds a per-object list; throwing it away left
+        # the user with "missing UV layer" and no idea which object or why.
+        raise RuntimeError(f"Bake target is not ready - {problems}")
 
     source_objs = []
     if props.use_selected_to_active:
@@ -1476,31 +1594,55 @@ def do_bake_batch(obj_names, props, context, source_obj_names=None):
 
     selected_for_bake = source_objs + objs_to_bake
 
-    def execute_bake():
+    def execute_bake(invoke=False):
+        # INVOKE_DEFAULT routes through bake_invoke, which starts a WM job:
+        # real progress bar, live redraw, and ESC sets G.is_break so the user
+        # can abort. The default EXEC path is bake_exec, which blocks the whole
+        # UI with no progress and (by design in the C source) never checks ESC.
+        how = 'INVOKE_DEFAULT' if invoke else 'EXEC_DEFAULT'
         if getattr(props, 'multires_bake', False):
-            return bpy.ops.object.bake_image()
-        return bpy.ops.object.bake(type=props.bake_type)
+            return bpy.ops.object.bake_image(how)
+        return bpy.ops.object.bake(how, type=props.bake_type)
 
-    try:
-        with bpy.context.temp_override(
-            active_object=active_obj,
-            selected_objects=selected_for_bake,
-            selected_editable_objects=selected_for_bake,
-        ):
-            result = execute_bake()
-    except RuntimeError as e:
+    if bpy.app.background:
         try:
+            with bpy.context.temp_override(
+                active_object=active_obj,
+                selected_objects=selected_for_bake,
+                selected_editable_objects=selected_for_bake,
+            ):
+                result = execute_bake()
+        except RuntimeError:
+            # The retry is the authoritative attempt. If it fails too, its
+            # error is the real one; re-raising the first hides the cause.
             result = execute_bake()
-        except Exception:
-            raise e
 
-    if not result or 'FINISHED' not in result:
-        raise RuntimeError("Blender cancelled the bake operation")
+        if not result or 'FINISHED' not in result:
+            raise RuntimeError("Blender cancelled the bake operation")
+        return True
 
-    return True
+    # Interactive: hand the bake to the job system and let the caller poll.
+    # Deliberately NOT wrapped in temp_override -- that runs the block in
+    # EXEC context, which downgrades INVOKE_DEFAULT back to the blocking
+    # bake_exec. The selection and active object set above are enough.
+    result = execute_bake(invoke=True)
+
+    if not result:
+        raise RuntimeError("Blender refused to start the bake")
+    if 'CANCELLED' in result:
+        # bake_invoke returns CANCELLED when a bake job is already running.
+        raise RuntimeError("Another bake is already running; try again")
+    if 'FINISHED' in result:
+        return True
+    return 'RUNNING_MODAL'
 
 
 def validate_bake_ready(obj_names, props, report):
+    """Returns None when every mesh is bake-ready, else the failure reason.
+
+    Callers must test `is not None`: the reason is a non-empty string, so a
+    truthiness check reads success backwards.
+    """
     failures = []
     tag = bake_node_tag(props.image_node_name)
     image_target = uses_image_bake_target(props)
@@ -1520,7 +1662,7 @@ def validate_bake_ready(obj_names, props, report):
                 modifier.type == 'MULTIRES' for modifier in obj.modifiers):
             failures.append(f"{obj_name}: no Multires modifier")
             continue
-        for slot_index in {poly.material_index for poly in obj.data.polygons}:
+        for slot_index in sorted({p.material_index for p in obj.data.polygons}):
             if slot_index >= len(obj.material_slots):
                 failures.append(f"{obj_name}: invalid material slot {slot_index + 1}")
                 continue
@@ -1540,8 +1682,8 @@ def validate_bake_ready(obj_names, props, report):
         if len(failures) > 4:
             preview += f"; +{len(failures) - 4} more"
         report({'ERROR'}, f"Bake setup incomplete: {preview}")
-        return False
-    return True
+        return preview
+    return None
 
 
 def get_object_bake_image(obj, props, material=None):
@@ -1650,7 +1792,7 @@ def remove_all_uvs(obj_names):
     return removed_count, obj_count
 
 
-def clear_and_renew_auto_seams(obj_names, props):
+def clear_and_renew_auto_seams(obj_names, props, report=None):
     seam_rad = math.radians(props.auto_seam_angle)
     count = 0
     force_object_mode()
@@ -1658,21 +1800,27 @@ def clear_and_renew_auto_seams(obj_names, props):
         obj = bpy.data.objects.get(obj_name)
         if not obj or obj.type != 'MESH':
             continue
-        mesh = obj.data
 
-        for edge in mesh.edges:
+        # Seams must be cleared *before* smart_project, otherwise interior
+        # seams from a previous run survive. Snapshot them anyway: the three
+        # operators below are fallible, and handing back a mesh with every seam
+        # stripped but stale UVs is worse than not touching it at all.
+        previous_seams = [(edge, edge.use_seam) for edge in obj.data.edges]
+        for edge, _seam in previous_seams:
             edge.use_seam = False
 
-        bpy.context.view_layer.objects.active = obj
+        enter_edit_select_all(obj, props.uv_layer_name)
         try:
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
             bpy.ops.uv.smart_project(angle_limit=seam_rad, island_margin=0.001)
             bpy.ops.uv.seams_from_islands(mark_seams=True, mark_sharp=False)
             bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
             count += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            force_object_mode()
+            for edge, seam in previous_seams:
+                edge.use_seam = seam
+            if report:
+                report({'WARNING'}, f"{obj_name}: seam renewal failed ({exc})")
         finally:
             force_object_mode()
     return count
@@ -1697,9 +1845,11 @@ def rename_objects_by_texture(obj_names, props, report):
         tiles = distribute_tiles(obj_names, props.tile_count)
         for tile_idx, tile_objs in enumerate(tiles):
             suffix = f"_{props.output_prefix}tile_{tile_idx + 1:02d}"
-            for o in tile_objs: predicted_suffixes[o] = suffix
+            for o in tile_objs:
+                predicted_suffixes[o] = suffix
     elif image_mode == 'ATLAS':
-        for o in obj_names: predicted_suffixes[o] = f"_{props.output_prefix}shared"
+        for o in obj_names:
+            predicted_suffixes[o] = f"_{props.output_prefix}shared"
     elif image_mode == 'COLLECTION_ATLASES':
         for atlas_number, atlas_objs in get_atlas_groups(obj_names, props):
             suffix = f"_{props.output_prefix}{get_collection_atlas_name(props, atlas_number)}"
@@ -1708,29 +1858,41 @@ def rename_objects_by_texture(obj_names, props, report):
 
     for obj_name in obj_names:
         obj = bpy.data.objects.get(obj_name)
-        if not obj: continue
+        if not obj:
+            continue
 
         actual_texture = obj.get("ahb_baked_texture")
         if not actual_texture:
             for slot in obj.material_slots:
-                if slot.material and slot.material.use_nodes:
+                if slot.material and slot.material.node_tree:
                     node = slot.material.node_tree.nodes.get(props.image_node_name)
                     if node and node.type == 'TEX_IMAGE' and node.image:
                         actual_texture = node.image.name
                         break
 
         if actual_texture:
-            suffix = f"_{actual_texture}".replace("Tile", "tile").replace("TILE", "tile")
+            suffix = f"_{actual_texture}"
         else:
             suffix = predicted_suffixes.get(obj.name)
 
         if not suffix:
             continue
 
-        if obj.name.endswith(suffix):
+        # Rename from the name the object had before this addon ever touched
+        # it, rather than trying to recognise our own suffixes. The tile an
+        # object lands in depends on world area and tile count, so both can
+        # change between runs and a suffix list goes stale -- that stacked
+        # `Chair_bake_tile_03_bake_tile_01`. The original is recorded on first
+        # rename, so later runs are exact and a user object whose real name
+        # contains the prefix is never truncated.
+        base = obj.get(RENAME_BASE_PROP)
+        if not base:
+            base = obj.name
+            obj[RENAME_BASE_PROP] = base
+        target = f"{base}{suffix}"
+        if target == obj.name:
             continue
-
-        obj.name = f"{obj.name}{suffix}"
+        obj.name = target
         renamed += 1
 
     return renamed
@@ -1767,7 +1929,7 @@ def group_objects_by_tile(obj_names, props, report):
         if not col_name: continue
 
         if not actual_texture:
-            obj["ahb_baked_texture"] = col_name
+            obj["ahb_texture_pack"] = col_name
 
         col = bpy.data.collections.get(col_name)
         if not col:
@@ -1784,8 +1946,14 @@ def group_objects_by_tile(obj_names, props, report):
     return moved
 
 
-def run_setup(obj_names, props, report):
+def run_setup_steps(obj_names, props, report):
+    """Prepare meshes, UVs and materials, yielding around the slow UV work.
+
+    Returns True/False via StopIteration.value so callers keep the original
+    contract. Only the UV work yields; everything else is milliseconds.
+    """
     normalize_core_names(props)
+    props.uv_gutter_px = -1.0   # re-measured per group below
     image_target = uses_image_bake_target(props)
     prepare_mesh_data(
         obj_names, make_unique=(props.auto_create_uv or not image_target))
@@ -1818,12 +1986,12 @@ def run_setup(obj_names, props, report):
                 continue
             if (bake_type_needs_uv(props) and props.auto_create_uv
                     and props.uv_layer_name not in obj.data.uv_layers):
-                ensure_uv(obj_name, props)
+                yield from ensure_uv_steps(obj_name, props)
             if not ensure_bake_color_attribute(obj):
                 report({'ERROR'}, f"Cannot create a bake color attribute on {obj_name}")
                 return False
 
-        if not validate_bake_ready(obj_names, props, report):
+        if validate_bake_ready(obj_names, props, report) is not None:
             return False
         msg = (f"Setup done: color attributes ready on "
                f"{len(obj_names)} object(s)")
@@ -1851,7 +2019,7 @@ def run_setup(obj_names, props, report):
         remove_tile_uv_offsets(obj_names, props.uv_layer_name)
         if props.auto_create_uv:
             try:
-                setup_atlas_uvs(obj_names, props)
+                yield from setup_atlas_uvs_steps(obj_names, props, report, "Atlas")
             except Exception as e:
                 report({'ERROR'}, f"Atlas UV setup failed: {e}")
                 force_object_mode()
@@ -1868,7 +2036,9 @@ def run_setup(obj_names, props, report):
             props.status_text = f"Setting up tile {tile_idx + 1}/{len(tiles)}…"
             if props.auto_create_uv:
                 try:
-                    setup_atlas_uvs(tile_obj_names, props)
+                    yield from setup_atlas_uvs_steps(
+                        tile_obj_names, props, report,
+                        f"Tile {tile_idx + 1}")
                 except Exception as e:
                     report({'ERROR'}, f"Tile {tile_idx + 1} UV setup failed: {e}")
                     force_object_mode()
@@ -1880,10 +2050,9 @@ def run_setup(obj_names, props, report):
                 if not obj:
                     continue
                 for slot in obj.material_slots:
-                    if slot.material:
-                        if not slot.material.use_nodes:
-                            slot.material.use_nodes = True
-                        inject_bake_node(slot.material.name, tile_img, props.image_node_name)
+                    if slot.material and slot.material.node_tree:
+                        inject_bake_node(
+                            slot.material.name, tile_img, props.image_node_name)
 
     elif image_mode == 'COLLECTION_ATLASES':
         for atlas_number, atlas_obj_names in collection_groups:
@@ -1892,34 +2061,37 @@ def run_setup(obj_names, props, report):
             remove_tile_uv_offsets(atlas_obj_names, props.uv_layer_name)
             if props.auto_create_uv:
                 try:
-                    setup_atlas_uvs(atlas_obj_names, props)
+                    yield from setup_atlas_uvs_steps(
+                        atlas_obj_names, props, report,
+                        f"Atlas {atlas_number}")
                 except Exception as e:
                     report({'ERROR'}, f"Atlas {atlas_number} UV setup failed: {e}")
                     force_object_mode()
                     return False
 
             atlas_img = get_collection_atlas_image(props, atlas_number)
-            atlas_mats = collect_material_names(atlas_obj_names)
-            for mat_name in atlas_mats:
+            for mat_name in collect_material_names(atlas_obj_names):
                 inject_bake_node(mat_name, atlas_img, props.image_node_name)
 
     elif image_mode == 'PER_MATERIAL':
         for obj_name in obj_names:
+            props.status_text = f"Setting up UVs on {obj_name}…"
             if props.auto_create_uv:
                 try:
-                    ensure_uv(obj_name, props)
+                    yield from ensure_uv_steps(obj_name, props)
                 except Exception as e:
                     report({'ERROR'}, f"UV setup failed [{obj_name}]: {e}")
                     force_object_mode()
                     return False
 
         for mat_name in mat_map:
-            img = get_or_create_image(props, mat_name)
-            inject_bake_node(mat_name, img, props.image_node_name)
+            inject_bake_node(
+                mat_name, get_or_create_image(props, mat_name),
+                props.image_node_name)
 
     ready_names = (flatten_atlas_groups(collection_groups)
                    if collection_groups is not None else obj_names)
-    if not validate_bake_ready(ready_names, props, report):
+    if validate_bake_ready(ready_names, props, report) is not None:
         return False
 
     msg = f"Setup done: {len(mat_map)} material(s) across {len(obj_names)} object(s)"
@@ -1928,216 +2100,376 @@ def run_setup(obj_names, props, report):
     return True
 
 
-def run_bake(obj_names, props, context, report, source_obj_names=None):
+def run_setup(obj_names, props, report, on_done=None):
+    """Drive the setup steps.
+
+    `on_done` is the only completion path when supplied, including under
+    `--background`, where it runs before this returns. Omit it to get the
+    boolean back directly.
+    """
+    steps = run_setup_steps(obj_names, props, report)
+    if bpy.app.background or on_done is None:
+        props.web3d_cancel_pending = False
+        while True:
+            try:
+                next(steps)
+            except StopIteration as finished:
+                if on_done is not None:
+                    on_done(finished.value)
+                    return None
+                return finished.value
+
+    def tick():
+        if props.web3d_cancel:
+            props.web3d_cancel = False
+            props.web3d_cancel_pending = False
+            props.bake_cancelled = True
+            force_object_mode()
+            report({'WARNING'}, "Setup cancelled by user.")
+            on_done(False)
+            return None
+        try:
+            next(steps)
+        except StopIteration as finished:
+            props.web3d_cancel_pending = False
+            on_done(finished.value)
+            return None
+        return 0.0
+
+    props.web3d_cancel = False
+    props.web3d_cancel_pending = True
+    bpy.app.timers.register(tick, first_interval=0.0)
+    return None
+
+
+def plan_bake_batches(obj_names, props, report, atlas_groups=None):
+    """Resolve the image mode into a flat list of (label, image, object_names).
+
+    Every image mode is the same shape -- tag each object with its target
+    image, inject the bake node, then bake the whole group at once -- so the
+    mode only decides how the groups are formed.
+    """
+    mode = props.image_mode
+    if not uses_image_bake_target(props):
+        return [(f"{len(obj_names)} object(s)", None, list(obj_names))]
+
+    def tag(names, image):
+        """Record the target image on each object and inject its bake node."""
+        valid = []
+        for obj_name in names:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj:
+                continue
+            obj["ahb_baked_texture"] = image.name
+            if any(slot.material for slot in obj.material_slots):
+                valid.append(obj_name)
+        return valid
+
+    if mode == 'AUTO_TILES':
+        return [
+            (f"Tile {idx + 1}", get_tile_image(props, idx), tile_names)
+            for idx, tile_names in enumerate(distribute_tiles(obj_names, props.tile_count))
+        ]
+
+    if mode == 'COLLECTION_ATLASES':
+        groups = atlas_groups or get_atlas_groups(obj_names, props, report)
+        batches = []
+        for atlas_number, atlas_names in groups:
+            if not atlas_names:
+                continue
+            name = get_collection_atlas_name(props, atlas_number)
+            batches.append((name, get_collection_atlas_image(props, atlas_number),
+                            atlas_names))
+        return batches
+
+    if mode == 'ATLAS':
+        return [("Single Atlas", get_or_create_image(props, "shared"),
+                 list(obj_names))]
+
+    # PER_MATERIAL: one image per material, baked in a single pass.
+    batches = []
+    valid_objs = set()
+    for mat_name, mat_obj_names in collect_material_names(obj_names).items():
+        mat_img = get_or_create_image(props, mat_name)
+        inject_bake_node(mat_name, mat_img, props.image_node_name)
+        valid_objs.update(mat_obj_names)
+        batches.append((mat_name, mat_img, mat_obj_names))
+
+    # Only single-image objects get a recorded assignment; multi-image objects
+    # would resolve to the wrong texture if they had one.
+    per_object = {}
+    for _label, mat_img, names in batches:
+        for obj_name in names:
+            per_object.setdefault(obj_name, set()).add(mat_img.name)
+    for obj_name, image_names in per_object.items():
+        obj = bpy.data.objects.get(obj_name)
+        if not obj:
+            continue
+        if len(image_names) == 1:
+            obj["ahb_baked_texture"] = next(iter(image_names))
+        elif "ahb_baked_texture" in obj:
+            del obj["ahb_baked_texture"]
+
+    ordered = sorted(valid_objs)
+    if ordered:
+        batches = [(f"{len(batches)} material image(s)", None, ordered)]
+    return batches
+
+
+def _inject_batch_nodes(image, obj_names, props):
+    """Inject the bake node into every material that owns a mesh in the batch."""
+    names = set()
+    for obj_name in obj_names:
+        obj = bpy.data.objects.get(obj_name)
+        if not obj:
+            continue
+        for slot in obj.material_slots:
+            mat = slot.material
+            if not mat:
+                continue
+            if not mat.node_tree:
+                continue
+            names.add(mat.name)
+            if image is not None:
+                inject_bake_node(mat.name, image, props.image_node_name)
+    return names
+
+
+def _install_bake_cancel_flag(flag):
+    """Return a handler pair that records ESC-cancel of the running bake.
+
+    Blender's own bake_modal handles ESC for a single bake, but it sets
+    G.is_break and knows nothing about us -- without this the runner would
+    happily start the next batch after the user aborted.
+    """
+    def on_cancel(_object):
+        flag['cancelled'] = True
+
+    def on_complete(_object):
+        flag['completed'] = True
+
+    bpy.app.handlers.object_bake_cancel.append(on_cancel)
+    bpy.app.handlers.object_bake_complete.append(on_complete)
+
+    def remove():
+        for handlers, func in ((bpy.app.handlers.object_bake_cancel, on_cancel),
+                               (bpy.app.handlers.object_bake_complete, on_complete)):
+            if func in handlers:
+                handlers.remove(func)
+
+    return remove
+
+
+class _BakeRunner:
+    """Runs bake batches one at a time through Blender's job system.
+
+    Each `do_bake_batch` starts a WM job; the next batch only starts once the
+    previous one has finished, so the interface stays live between batches and
+    Blender's own progress bar and ESC handling stay active during them.
+
+    The UV stages cannot use a job -- `bpy.ops.uv.*` is EXEC-only -- so they
+    are driven as generators by `run_setup` instead and share this runner's
+    cancel flag and interval.
+    """
+
+    def __init__(self, batches, props, context, report, source_obj_names):
+        self.batches = list(batches)
+        self.props = props
+        self.context = context
+        self.report = report
+        self.source_obj_names = source_obj_names
+        self.index = 0
+        self.baked_names = set()
+        self.errors = 0
+        self.cancelled = False
+        self._label = ""
+        self._pending = ()
+        self._flag = {'cancelled': False}
+        self._remove_handlers = None
+
+    def _step(self):
+        """Advance the run. Returns False once there is nothing left to do."""
+        if self._remove_handlers is not None:
+            if bpy.context.window_manager.is_interface_locked:
+                return True
+            if bpy.app.is_job_running('OBJECT_BAKE'):
+                return True
+            self._remove_handlers()
+            self._remove_handlers = None
+            if self._flag['cancelled']:
+                self.cancelled = True
+                self.report({'WARNING'}, f"Bake cancelled during {self._label}.")
+                return False
+            self.baked_names.update(self._pending)
+            self.report(
+                {'INFO'},
+                f"[{self._label}] Baked {len(self._pending)} object(s)")
+
+        while self.index < len(self.batches):
+            label, _image, names = self.batches[self.index]
+            self.index += 1
+            if not names:
+                continue
+            self.props.status_text = (
+                f"Baking {label} ({len(names)} objects, "
+                f"{self.index}/{len(self.batches)} batches)")
+            force_ui_redraw()
+            try:
+                result = do_bake_batch(
+                    names, self.props, self.context, self.source_obj_names)
+            except Exception as e:
+                self.errors += 1
+                self.report({'ERROR'}, f"Bake FAILED [{label}]: {e}")
+                continue
+            if result is True:
+                self.baked_names.update(names)
+                self.report({'INFO'}, f"[{label}] Baked {len(names)} object(s)")
+                continue
+            # A job is now running; hand control back until it ends.
+            self._label, self._pending = label, names
+            self._flag = {'cancelled': False}
+            self._remove_handlers = _install_bake_cancel_flag(self._flag)
+            return True
+        return False
+
+    def run(self):
+        """Drive every batch to completion without yielding.
+
+        Only valid under `--background`, where `do_bake_batch` takes the
+        blocking EXEC path. Interactively a batch returns 'RUNNING_MODAL' and
+        nothing would ever service the job, so this spins forever -- fail loudly
+        instead.
+        """
+        if not bpy.app.background:
+            raise RuntimeError(
+                "_BakeRunner.run() cannot drive an interactive bake; the "
+                "batches run as WM jobs and need start_async().")
+        while self._step():
+            pass
+
+    def start_async(self, on_finish):
+        """Return a timer callback that finishes the run and reports back."""
+        self.props.web3d_cancel = False
+        self.props.web3d_cancel_pending = True
+
+        def tick():
+            if self.props.web3d_cancel:
+                self.cancelled = True
+                self.props.web3d_cancel = False
+                self.props.web3d_cancel_pending = False
+                self.report({'WARNING'}, "Bake cancelled by user.")
+                on_finish(self)
+                return None
+            if self._step():
+                return 0.1
+            self.props.web3d_cancel_pending = False
+            on_finish(self)
+            return None
+
+        return tick
+
+
+def run_bake(obj_names, props, context, report, source_obj_names=None,
+             on_done=None):
+    """Bake `obj_names` and report `(baked_count, error_count)`.
+
+    Interactive runs drive the bake through Blender's job system so the UI
+    stays live and ESC aborts. When `on_done` is supplied it is the only
+    completion path -- including under `--background`, where it is invoked
+    before this function returns. Omit it to get `(baked, errors)` back
+    directly, which blocks until the bake finishes.
+    """
     normalize_core_names(props)
     if (props.bake_type in PASS_FILTER_TYPES
             and not (props.use_pass_direct or props.use_pass_indirect
                      or props.use_pass_color)):
         report({'ERROR'}, "Enable at least one Direct, Indirect, or Color pass.")
-        return 0, 1
+        return (0, 1) if on_done is None else None
 
     try:
         configure_bake_settings(props, context)
     except Exception as e:
         report({'ERROR'}, f"Cannot configure bake: {e}")
-        return 0, 1
+        return (0, 1) if on_done is None else None
 
-    image_mode = props.image_mode
     all_mat_names = set()
-    baked_names = set()
-    errors = 0
     total = len(obj_names)
 
     if not uses_image_bake_target(props):
-        props.status_text = f"Baking color attributes on {len(obj_names)} object(s)"
-        force_ui_redraw()
-        try:
-            if do_bake_batch(obj_names, props, context, source_obj_names):
-                baked_names.update(obj_names)
-                for obj_name in obj_names:
-                    obj = bpy.data.objects.get(obj_name)
-                    attribute = get_bake_color_attribute(obj)
-                    if obj and attribute:
-                        obj[BAKE_COLOR_ATTRIBUTE_PROP] = attribute.name
-                report({'INFO'}, f"Baked color attributes on {len(obj_names)} object(s)")
-        except Exception as e:
-            errors += 1
-            report({'ERROR'}, f"Color attribute bake FAILED: {e}")
+        batches = [(f"{len(obj_names)} object(s)", None, list(obj_names))]
+    else:
+        atlas_groups = None
+        if props.image_mode == 'COLLECTION_ATLASES':
+            atlas_groups = get_atlas_groups(obj_names, props, report)
+            isolate_materials_between_atlas_groups(atlas_groups)
+            total = len(flatten_atlas_groups(atlas_groups))
+        batches = plan_bake_batches(obj_names, props, report, atlas_groups)
+        for _label, image, names in batches:
+            all_mat_names |= _inject_batch_nodes(image, names, props)
+        context.scene.render.bake.use_clear = props.clear_bake
 
-    elif image_mode == 'AUTO_TILES':
-        tiles = distribute_tiles(obj_names, props.tile_count)
-        for tile_idx, tile_obj_names in enumerate(tiles):
-            tile_img = get_tile_image(props, tile_idx)
-            valid_objs = []
-            for obj_name in tile_obj_names:
+    runner = _BakeRunner(batches, props, context, report, source_obj_names)
+
+    def finish(finished):
+        baked = len(finished.baked_names)
+        errors = finished.errors
+        props.bake_cancelled = finished.cancelled
+
+        if baked and not uses_image_bake_target(props):
+            for obj_name in finished.baked_names:
                 obj = bpy.data.objects.get(obj_name)
-                if not obj:
+                attribute = get_bake_color_attribute(obj)
+                if obj and attribute:
+                    obj[BAKE_COLOR_ATTRIBUTE_PROP] = attribute.name
+
+        # Save failures are counted separately. Folding them into `errors` made
+        # a fully successful bake report "Bake incomplete" and abort the build
+        # over a filesystem problem, hiding the fact that the textures are fine.
+        save_errors = 0
+        if (uses_image_bake_target(props) and props.auto_save
+                and getattr(props, 'save_mode', 'EXTERNAL') == 'EXTERNAL'):
+            props.status_text = "Saving images\u2026"
+            force_ui_redraw()
+            for img in list(owned_bake_images(props)):
+                if not img.has_data:
                     continue
-                obj["ahb_baked_texture"] = tile_img.name
-                has_mat = False
-                for slot in obj.material_slots:
-                    if slot.material:
-                        if not slot.material.use_nodes:
-                            slot.material.use_nodes = True
-                        all_mat_names.add(slot.material.name)
-                        inject_bake_node(slot.material.name, tile_img, props.image_node_name)
-                        has_mat = True
-                if has_mat:
-                    valid_objs.append(obj_name)
-
-            if not valid_objs:
-                continue
-            bake = context.scene.render.bake
-            bake.use_clear = props.clear_bake
-            props.status_text = f"Baking tile {tile_idx + 1}/{len(tiles)} ({len(valid_objs)} objects)"
-            force_ui_redraw()
-
-            try:
-                success = do_bake_batch(valid_objs, props, context, source_obj_names)
-                if success:
-                    baked_names.update(valid_objs)
-                    report({'INFO'}, f"[Tile {tile_idx + 1}] Baked {len(valid_objs)} objects")
-            except Exception as e:
-                errors += 1
-                report({'ERROR'}, f"Bake FAILED [Tile {tile_idx + 1}]: {e}")
-
-    elif image_mode == 'COLLECTION_ATLASES':
-        groups = get_atlas_groups(obj_names, props, report)
-        total = len(flatten_atlas_groups(groups))
-        isolate_materials_between_atlas_groups(groups)
-        for atlas_number, atlas_obj_names in groups:
-            if not atlas_obj_names:
-                continue
-            col_name = get_collection_atlas_name(props, atlas_number)
-            atlas_img = get_collection_atlas_image(props, atlas_number)
-            valid_objs = []
-            for obj_name in atlas_obj_names:
-                obj = bpy.data.objects.get(obj_name)
-                if not obj:
-                    continue
-                obj["ahb_baked_texture"] = atlas_img.name
-                has_mat = False
-                for slot in obj.material_slots:
-                    if slot.material:
-                        if not slot.material.use_nodes:
-                            slot.material.use_nodes = True
-                        all_mat_names.add(slot.material.name)
-                        inject_bake_node(slot.material.name, atlas_img, props.image_node_name)
-                        has_mat = True
-                if has_mat:
-                    valid_objs.append(obj_name)
-
-            if not valid_objs:
-                continue
-            bake = context.scene.render.bake
-            bake.use_clear = props.clear_bake
-            props.status_text = f"Baking {col_name} ({len(valid_objs)} objects)"
-            force_ui_redraw()
-
-            try:
-                success = do_bake_batch(valid_objs, props, context, source_obj_names)
-                if success:
-                    baked_names.update(valid_objs)
-                    report({'INFO'}, f"[{col_name}] Baked {len(valid_objs)} objects")
-            except Exception as e:
-                errors += 1
-                report({'ERROR'}, f"Bake FAILED [{col_name}]: {e}")
-
-    elif image_mode == 'ATLAS':
-        atlas_img = get_or_create_image(props, "shared")
-        valid_objs = []
-        for obj_name in obj_names:
-            obj = bpy.data.objects.get(obj_name)
-            if not obj:
-                continue
-            obj["ahb_baked_texture"] = atlas_img.name
-            has_mat = False
-            for slot in obj.material_slots:
-                if slot.material:
-                    if not slot.material.use_nodes:
-                        slot.material.use_nodes = True
-                    all_mat_names.add(slot.material.name)
-                    inject_bake_node(slot.material.name, atlas_img, props.image_node_name)
-                    has_mat = True
-            if has_mat:
-                valid_objs.append(obj_name)
-
-        if valid_objs:
-            bake = context.scene.render.bake
-            bake.use_clear = props.clear_bake
-            props.status_text = f"Baking Single Atlas ({len(valid_objs)} objects)"
-            force_ui_redraw()
-
-            try:
-                success = do_bake_batch(valid_objs, props, context, source_obj_names)
-                if success:
-                    baked_names.update(valid_objs)
-                    report({'INFO'}, f"Baked Single Atlas ({len(valid_objs)} objects)")
-            except Exception as e:
-                errors += 1
-                report({'ERROR'}, f"Bake FAILED: {e}")
-
-    elif image_mode == 'PER_MATERIAL':
-        mat_map = collect_material_names(obj_names)
-        valid_objs = set()
-        object_material_images = {}
-        for mat_name, mat_obj_names in mat_map.items():
-            mat_img = get_or_create_image(props, mat_name)
-            inject_bake_node(mat_name, mat_img, props.image_node_name)
-            all_mat_names.add(mat_name)
-            for obj_name in mat_obj_names:
-                obj = bpy.data.objects.get(obj_name)
-                if not obj:
-                    continue
-                valid_objs.add(obj_name)
-                object_material_images.setdefault(obj_name, set()).add(mat_img.name)
-
-        for obj_name, image_names in object_material_images.items():
-            obj = bpy.data.objects.get(obj_name)
-            if not obj:
-                continue
-            if len(image_names) == 1:
-                obj["ahb_baked_texture"] = next(iter(image_names))
-            elif "ahb_baked_texture" in obj:
-                del obj["ahb_baked_texture"]
-
-        if valid_objs:
-            valid_objs = sorted(valid_objs)
-            bake = context.scene.render.bake
-            bake.use_clear = props.clear_bake
-            props.status_text = f"Baking {len(mat_map)} material image(s) across {len(valid_objs)} object(s)"
-            force_ui_redraw()
-
-            try:
-                success = do_bake_batch(valid_objs, props, context, source_obj_names)
-                if success:
-                    baked_names.update(valid_objs)
-                    report({'INFO'}, f"Baked {len(mat_map)} per-material image(s)")
-            except Exception as e:
-                errors += 1
-                report({'ERROR'}, f"Per-material bake FAILED: {e}")
-
-    if (uses_image_bake_target(props) and props.auto_save
-            and getattr(props, 'save_mode', 'EXTERNAL') == 'EXTERNAL'):
-        props.status_text = "Saving images…"
-        force_ui_redraw()
-        saved = 0
-        for img in bpy.data.images:
-            if img.name.startswith(props.output_prefix) and img.has_data:
                 try:
-                    path = save_image(img, props, context)
-                    saved += 1
+                    save_image(img, props, context)
                 except Exception as e:
-                    errors += 1
+                    save_errors += 1
                     report({'WARNING'}, f"Save failed [{img.name}]: {e}")
 
-    if props.auto_cleanup_nodes and baked_names and all_mat_names:
-        remove_bake_nodes(all_mat_names, props.image_node_name)
+        if props.auto_cleanup_nodes and baked and all_mat_names:
+            remove_bake_nodes(all_mat_names, props.image_node_name)
 
-    baked = len(baked_names)
-    msg = f"Baked {baked}/{total} object(s). Errors: {errors}"
-    report({'INFO'}, msg)
-    return baked, errors
+        report(
+            {'INFO'},
+            f"Baked {baked}/{total} object(s). Errors: {errors}"
+            + (f", unsaved images: {save_errors}" if save_errors else ""))
+        if save_errors:
+            props.status_text = (
+                f"Baked {baked}/{total} object(s), but {save_errors} image(s) "
+                f"could not be written to disk.")
+        if on_done is not None:
+            on_done(baked, errors)
+        return baked, errors
+
+    if bpy.app.background:
+        runner.run()
+        if on_done is None:
+            return finish(runner)
+        finish(runner)
+        return None
+
+    if on_done is None:
+        # Interactively the bake is a WM job with nothing to block on, so there
+        # is no way to hand the result back synchronously.
+        report({'WARNING'},
+               "run_bake() was called without on_done in an interactive "
+               "session; the result cannot be returned synchronously.")
+    bpy.app.timers.register(
+        runner.start_async(finish), first_interval=0.1)
+    return None
 
 
 def resolve_apply_mode(props):
@@ -2331,12 +2663,31 @@ def apply_baked_color_to_material(
     return True
 
 
+def find_material_backup(mat):
+    """This addon's backup of `mat`, or None.
+
+    Looked up by recorded source name, not by `<name>_AHB_backup`. When a user
+    already owns that name Blender uniquifies our copy to `..._AHB_backup.001`,
+    so a name lookup never finds it again and every call leaked another backup.
+    Matching on the name also adopted a user's own `X_AHB_backup` as ours,
+    which made `restore_material_backups` rename the user's material.
+    """
+    for candidate in bpy.data.materials:
+        if (candidate.get(OWNED_MATERIAL_PROP)
+                and candidate.get(BACKUP_SOURCE_PROP) == mat.name):
+            return candidate
+    return None
+
+
 def ensure_material_backup(mat):
-    backup_name = f"{mat.name}_AHB_backup"
-    backup = bpy.data.materials.get(backup_name)
-    if not backup:
-        backup = mat.copy()
-        backup.name = backup_name
+    """Return this addon's copy of `mat`, creating it once."""
+    existing = find_material_backup(mat)
+    if existing is not None:
+        return existing
+    backup = mat.copy()
+    backup[OWNED_MATERIAL_PROP] = True
+    backup[BACKUP_SOURCE_PROP] = mat.name
+    backup.name = f"{mat.name}_AHB_backup"
     return backup
 
 
@@ -2377,9 +2728,18 @@ def apply_grouped_bake_images(groups, props, mode):
 
     for group_key, suffix, object_names, image in groups:
         if not image:
-            skipped += sum(
-                len(obj.material_slots) for name in object_names
-                if (obj := bpy.data.objects.get(name)))
+            # Count materials, not slots, so `applied` and `skipped` share a
+            # unit. Counting slots made one material used twice look like two
+            # failures and sank the whole build.
+            missing = set()
+            for name in object_names:
+                obj = bpy.data.objects.get(name)
+                if not obj:
+                    continue
+                for slot in obj.material_slots:
+                    if slot.material:
+                        missing.add(slot.material)
+            skipped += len(missing)
             continue
 
         done_in_group = set()
@@ -2489,11 +2849,16 @@ def run_apply(obj_names, props, report):
                 if props.image_mode == 'ATLAS':
                     image = bpy.data.images.get(f"{props.output_prefix}shared")
                 elif props.image_mode == 'PER_MATERIAL':
+                    # Never fall back to `shared` here: the single-atlas image
+                    # has an unrelated UV layout and would silently produce a
+                    # garbage texture that still reports success.
                     image = bpy.data.images.get(f"{props.output_prefix}{mat.name}")
-                if not image:
-                    image = bpy.data.images.get(f"{props.output_prefix}shared")
-                if not image:
-                    image = bpy.data.images.get(f"{props.output_prefix}{mat.name}")
+                    if not image:
+                        report(
+                            {'WARNING'},
+                            f"{mat.name}: no per-material bake image; skipped")
+                        skipped += 1
+                        continue
                 if not image:
                     skipped += 1
                     continue
@@ -2514,7 +2879,7 @@ def run_apply(obj_names, props, report):
     return applied, skipped
 
 
-def restore_material_backups(obj_names):
+def restore_material_backups(obj_names, props=None):
     replacements = {}
     for obj_name in obj_names:
         obj = bpy.data.objects.get(obj_name)
@@ -2524,8 +2889,8 @@ def restore_material_backups(obj_names):
             mat = slot.material
             if not mat:
                 continue
-            backup = bpy.data.materials.get(f"{mat.name}_AHB_backup")
-            if backup:
+            backup = find_material_backup(mat)
+            if backup is not None:
                 replacements[mat] = backup
 
     for obj_name in obj_names:
@@ -2539,22 +2904,50 @@ def restore_material_backups(obj_names):
     restored = 0
     for modified, backup in replacements.items():
         original_name = modified.name
-        modified.name = f"{original_name}_AHB_modified"
+        # Only rename our clone. If the material is still used outside the
+        # restored scope it keeps `users > 0`, and renaming it would leave those
+        # objects pointing at a mangled name with no way back.
+        if modified.get(OWNED_MATERIAL_PROP) or modified.users == 0:
+            modified.name = f"{original_name}_AHB_modified"
+            if modified.users == 0:
+                bpy.data.materials.remove(modified)
         backup.name = original_name
-        if modified.users == 0:
-            bpy.data.materials.remove(modified)
         restored += 1
-    restore_image_uv_backups(obj_names)
+    restore_image_uv_backups(
+        obj_names,
+        props.image_node_name if props is not None else None,
+    )
     return restored
 
 
-def save_and_restore_selection(context, func):
+def status_reporter(props, scene=None):
+    """A report() callable that survives after the operator is gone.
+
+    Deferred bake completion runs from a timer, by which point Blender has
+    freed the operator's RNA struct -- calling `self.report` there raises
+    `ReferenceError: StructRNA ... has been removed`.
+    """
+    def report(level, message):
+        text = str(message)
+        if level in {'ERROR', 'WARNING'}:
+            props.status_text = text
+        if scene is not None and hasattr(scene, 'web3d_status'):
+            scene.web3d_status = text
+        print(f"[Web3D] {level}: {text}")
+
+    return report
+
+
+def selection_snapshot(context):
+    """Return a callable that restores the active object and selection.
+
+    Kept separate from `save_and_restore_selection` so an asynchronous bake can
+    hold the snapshot open until its completion callback fires.
+    """
     active_obj = context.view_layer.objects.active
     selected_objects = list(context.selected_objects)
 
-    try:
-        result = func()
-    finally:
+    def restore():
         force_object_mode()
         try:
             bpy.ops.object.select_all(action='DESELECT')
@@ -2572,4 +2965,12 @@ def save_and_restore_selection(context, func):
             except Exception:
                 pass
 
-    return result
+    return restore
+
+
+def save_and_restore_selection(context, func):
+    restore = selection_snapshot(context)
+    try:
+        return func()
+    finally:
+        restore()

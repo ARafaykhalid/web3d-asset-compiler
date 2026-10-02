@@ -18,7 +18,7 @@ Thank you for your interest in contributing to **Web3D Asset Compiler** by Abdul
 
 3. **Running Extension Validation**:
    ```bash
-   python scripts/validate_extension.py
+   blender --command extension validate addon/web3d_asset_compiler --valid-tags=""
    ```
 
 4. **Running Unit Tests**:
@@ -41,8 +41,8 @@ Thank you for your interest in contributing to **Web3D Asset Compiler** by Abdul
 ## Code Guidelines
 
 - **Preserve Existing Functionality**: Ensure no regressions occur in baking or exporting pipelines.
-- **Graceful Fallbacks**: Optional third-party software (such as UVPackmaster or Draco) must degrade gracefully when missing.
-- **Single Source of Versioning**: Versioning must be updated in `addon/web3d_asset_compiler/version.py` and `blender_manifest.toml`.
+- **Graceful Fallbacks**: Optional third-party software (such as Draco) must degrade gracefully when missing.
+- **Single Source of Versioning**: Versioning lives only in `addon/web3d_asset_compiler/blender_manifest.toml`; the build script derives the artifact name from it.
 - **Formatting**: Follow PEP 8 guidelines for Python code readability.
 
 ## Submitting Pull Requests
@@ -51,3 +51,34 @@ Thank you for your interest in contributing to **Web3D Asset Compiler** by Abdul
 2. Run validation scripts and ensure all tests pass.
 3. Commit your changes with clear messages (`git commit -m "Add feature X"`).
 4. Push to your branch and open a Pull Request.
+
+## Running the checks
+
+The full set, all of which run in CI:
+
+```bash
+# Manifest, plus a syntax pass over the package
+blender --command extension validate addon/web3d_asset_compiler --valid-tags=""
+python scripts/build_extension.py
+
+# Registration and the full bake/export pipeline
+blender --background --factory-startup -noaudio --python-exit-code 1 \
+  --python tests/test_blender_addon_register.py
+blender --background --factory-startup -noaudio --python-exit-code 1 \
+  --python tests/test_blender_pipeline_smoke.py
+
+# Every UI panel, drawn with a real UILayout. Needs a display.
+xvfb-run -a blender --factory-startup --python-exit-code 1 \
+  --python tests/test_ui_draw.py
+
+# The web examples, checked against real three.js / @react-three/fiber types
+blender --background --factory-startup -noaudio --python-exit-code 1 \
+  --python tests/export_fixtures.py
+cd examples && npm install && npm run check
+```
+
+`tests/test_ui_draw.py` exists because Blender swallows exceptions raised inside
+`Panel.draw`: a panel referencing a removed property keeps registering cleanly and
+only breaks when somebody opens that tab. The export fixture exists because the
+examples are the only documentation of the generated controller's API, and they
+drift silently when that API changes.

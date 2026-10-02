@@ -47,3 +47,9 @@ env/
 
 # Logs
 *.log
+
+# Web examples: exporter output and npm dependencies are not committed.
+# Regenerate with tests/export_fixtures.py, then `npm run check` in examples/.
+examples/generated/
+examples/node_modules/
+examples/package-lock.json
