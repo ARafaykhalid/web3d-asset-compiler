@@ -6,14 +6,14 @@ This document details the architectural layout of **Web3D Asset Compiler**.
 
 ```
 addon/web3d_asset_compiler/
-├── __init__.py         # Addon entrypoint & idempotent class registration
+├── __init__.py         # Extension entrypoint; registers every class
 ├── blender_manifest.toml # Extension platform manifest
-├── baking/             # Auto HDR Baker system
+├── baking/             # UV + lightmap baking stage
 │   ├── properties.py   # AHB_Properties definition
 │   ├── pipeline.py     # Baking execution, Cycles compute, UV packing, image saving
 │   ├── json_io.py      # Serialization of materials & PBR settings to JSON
 │   └── operators.py   # AHB_OT_* Blender operators
-├── exporter/           # Three.js Exporter system
+├── exporter/           # GLB + binary animation export stage
 │   ├── properties.py   # TJS_Properties definition
 │   ├── character_exporter.py # Animation-free GLB model export
 │   ├── binary_exporter.py    # Binary animation encoding (.anim) & manifest
@@ -30,16 +30,21 @@ addon/web3d_asset_compiler/
 └── utils/              # Helper utilities
     ├── mesh_utils.py   # Mesh data uniqueness & slot preparation
     ├── uv_utils.py     # UV map backups & implicit coordinate preservation
-    └── logging_utils.py# Safe filenames & UI redraw helpers
+    └── logging_utils.py# Safe filenames & cheap redraw requests
 
 scripts/
 └── build_extension.py    # Packages dist/web3d_asset_compiler-<version>.zip
 
+examples/
+├── sample_threejs_loader.ts # Three.js integration example
+├── sample_r3f_component.tsx # React Three Fiber integration example
+└── package.json / tsconfig.json # Type-checks both against exporter output
+
 tests/
-├── test_blender_addon_register.py # Registration & operator coverage test
-├── test_blender_pipeline_smoke.py  # Headless baking & export pipeline smoke test
-├── test_blender_addon_register.py
-└── test_blender_pipeline_smoke.py
+├── test_blender_addon_register.py # Registration & operator coverage
+├── test_blender_pipeline_smoke.py  # Headless bake + export pipeline
+├── test_ui_draw.py                 # Every panel drawn with a real UILayout
+└── export_fixtures.py              # Exports a rig for the examples typecheck
 ```
 
 ## Data Flow & Execution Pipeline
@@ -51,13 +56,13 @@ tests/
    [ 1. Preserve Source UVs & Materials ]
                │
                ▼
-   [ 2. Generate UVs & Pack Islands ] ──► verify gutter + bounds
+   [ 2. Generate UVs & Pack Islands ] ──► measure gutter + bounds
                │
                ▼
-   [ 3. Configure Cycles Compute ] ──► OptiX / CUDA / HIP / Metal / CPU
+   [ 3. Configure Cycles Compute ] ──► OptiX / CUDA / HIP / oneAPI / Metal
                │
                ▼
-   [ 4. Execute Lightmap Bake ]
+   [ 4. Execute Lightmap Bake ] ──► runs as a WM job, cancellable
                │
                ▼
    [ 5. Save Images & Rewire Shaders ] ──► Emission / Base Color Shader
@@ -71,3 +76,31 @@ tests/
                ▼
    [ 8. Generate TS Controller & Manifest ]
 ```
+
+Stages 1-5 only run if every earlier stage succeeded: a failed or cancelled bake
+never reaches export.
+
+## Why the build is staged rather than one blocking call
+
+Blender exposes asynchronous paths for very few things. Baking has one
+(`object.bake` can start a WM job via `INVOKE_DEFAULT`, which also brings the
+progress bar and ESC handling). UV operators have none at all — a single
+`bpy.ops.uv.pack_islands` call is atomic and cannot be interrupted.
+
+So the two halves are handled differently:
+
+- **Baking** runs one WM job at a time. `_BakeRunner` starts a job, polls
+  `bpy.app.is_job_running('OBJECT_BAKE')` from a timer, and starts the next batch
+  when the previous one ends. Cancellation is observed through
+  `bpy.app.handlers.object_bake_cancel`.
+- **UV work** is a generator (`run_setup_steps`, `atlas_pack_phase_steps`) that
+  yields between pack passes and between groups, driven from the same timer. The
+  longest uninterruptible unit is therefore a single pack pass.
+
+Both halves share one cancellation flag, surfaced as a **Cancel Build** button
+that is only drawn while a build is in flight.
+
+Deferred work must never touch the operator that started it: by the time a timer
+callback runs, Blender has freed the operator's RNA struct. Reporting therefore
+goes through `status_reporter()`, which writes to the scene properties instead of
+`self.report`.

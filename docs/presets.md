@@ -11,4 +11,18 @@ Web3D Asset Compiler provides four built-in optimization presets.
 
 ## Customizing Presets
 
-To override preset values, simply select a preset and adjust individual parameters in the **Texture & Lightmap Baker** or **Web Animation & Model Exporter** sections.
+Apply a preset, then adjust any individual parameter — presets only set values,
+they do not lock them. Baking settings live under **Texture & Lightmap Baker**,
+export settings under **Web Animation & Model Exporter**.
+
+Presets change the atlas resolution and image mode, so they also change the
+expected gutter and texel density. After a preset-driven bake the pack is
+verified like any other: check the reported gutter in the status line before
+shipping.
+
+## Bake Time
+
+Resolution is the dominant cost. 4K (`4096`) presets such as **Three.js - High
+Quality** and **ArchViz - Lightmap Quality** take considerably longer than 1K,
+and the pack step alone scales with the square of the resolution. Bake as a
+background job: the interface stays responsive and <kbd>Esc</kbd> cancels.

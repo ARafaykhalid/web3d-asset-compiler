@@ -36,7 +36,8 @@ Thank you for your interest in contributing to **Web3D Asset Compiler** by Abdul
    ```bash
    python scripts/build_extension.py
    ```
-   The built archive will be saved to `dist/web3d_asset_compiler-1.0.0.zip`.
+   The archive name is read from `blender_manifest.toml`, so bumping the
+version there is enough: `dist/web3d_asset_compiler-<version>.zip`.
 
 ## Code Guidelines
 
